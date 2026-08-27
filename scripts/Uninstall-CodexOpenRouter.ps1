@@ -1,10 +1,10 @@
-[CmdletBinding(SupportsShouldProcess = $true)]
+#Requires -Version 7.4
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [string]$CodexHome,
 
     [string]$ProfilePath,
-
-    [switch]$KeepCurrentProvider,
 
     [switch]$RemoveApiKey
 )
@@ -12,894 +12,521 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$commonHelperPath = Join-Path `
-    $repositoryRoot `
-    'src\CodexOpenRouter\CodexOpenRouter.Common.ps1'
-if (-not (Test-Path -LiteralPath $commonHelperPath -PathType Leaf)) {
-    throw "找不到共同安全 helper：$commonHelperPath"
+if (-not $IsWindows) {
+    throw 'Codex OpenRouter Toolkit 仅支持 Windows。'
 }
-$commonHelperItem = Get-Item `
-    -LiteralPath $commonHelperPath `
-    -Force `
-    -ErrorAction Stop
-if (($commonHelperItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-    $commonHelperItem.Length -gt 25MB) {
-    throw "共同安全 helper 不是受支持的普通文件或超过 26214400 字节限制：$commonHelperPath"
-}
-. $commonHelperPath
 
-function ConvertFrom-UninstallerUtf8Bytes {
+$script:ToolkitGuid = 'be74dba0-28ed-4ba3-adff-f0fc0d107b39'
+$script:ProfileStartMarkers = @(
+    '# >>> codex-openrouter-toolkit >>>',
+    '# >>> Codex desktop provider shortcuts >>>'
+)
+$script:ProfileEndMarkers = @(
+    '# <<< codex-openrouter-toolkit <<<',
+    '# <<< Codex desktop provider shortcuts <<<'
+)
+
+function Resolve-AbsolutePath {
     param(
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [byte[]]$Bytes,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Label
-    )
-
-    $offset = if ($Bytes.Length -ge 3 -and
-        $Bytes[0] -eq 0xEF -and
-        $Bytes[1] -eq 0xBB -and
-        $Bytes[2] -eq 0xBF) {
-        3
-    }
-    else { 0 }
-    try {
-        return [Text.UTF8Encoding]::new($false, $true).GetString(
-            $Bytes,
-            $offset,
-            $Bytes.Length - $offset
-        )
-    }
-    catch {
-        throw "$Label 不是有效的 UTF-8 文本：$($_.Exception.Message)"
-    }
-}
-
-function Get-UninstallerAbsolutePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
+        [Parameter(Mandatory = $true)] [string]$Path,
+        [Parameter(Mandatory = $true)] [string]$Label
     )
 
     if ([string]::IsNullOrWhiteSpace($Path) -or
         -not [IO.Path]::IsPathFullyQualified($Path)) {
-        throw "$Name 必须是完整绝对路径。"
+        throw "$Label 必须是完整绝对路径。"
     }
-    try {
-        return [IO.Path]::GetFullPath($Path)
+    try { return [IO.Path]::GetFullPath($Path) }
+    catch { throw "$Label 无法规范化：$($_.Exception.Message)" }
+}
+
+function Test-PathEqual {
+    param(
+        [Parameter(Mandatory = $true)] [string]$Left,
+        [Parameter(Mandatory = $true)] [string]$Right
+    )
+
+    return [string]::Equals(
+        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Left)),
+        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Right)),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Assert-RegularFile {
+    param(
+        [Parameter(Mandatory = $true)] [string]$Path,
+        [Parameter(Mandatory = $true)] [string]$Label,
+        [long]$MaximumBytes = 5MB
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Label 不存在或不是普通文件：$Path"
     }
-    catch {
-        throw "$Name 无法规范化：$($_.Exception.Message)"
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label 不能是重解析点：$Path"
+    }
+    if ($item.Length -gt $MaximumBytes) {
+        throw "$Label 超过 $MaximumBytes 字节限制：$Path"
     }
 }
 
-function Assert-UninstallerNoReparsePoint {
+function Assert-SafeDirectoryTree {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [switch]$Recurse,
-
-        [ValidateRange(1, 100000)]
-        [int]$MaximumEntries = 4096
+        [Parameter(Mandatory = $true)] [string]$Path,
+        [Parameter(Mandatory = $true)] [string]$Label,
+        [int]$MaximumEntries = 64
     )
 
-    $probe = [IO.Path]::GetFullPath($Path)
-    while (-not (Test-Path -LiteralPath $probe)) {
-        $parent = Split-Path -Parent $probe
-        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $probe) {
-            break
-        }
-        $probe = $parent
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "$Label 不存在或不是目录：$Path"
     }
-    while (Test-Path -LiteralPath $probe) {
-        $item = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label 不能是重解析点：$Path"
+    }
+    $count = 1
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force -Recurse) {
+        $count++
+        if ($count -gt $MaximumEntries) {
+            throw "$Label 超过 $MaximumEntries 项限制：$Path"
+        }
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Name 的现有路径包含重解析点：$($item.FullName)"
-        }
-        $parent = Split-Path -Parent $probe
-        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $probe) {
-            break
-        }
-        $probe = $parent
-    }
-
-    $resolvedPath = [IO.Path]::GetFullPath($Path)
-    if (-not $Recurse -or -not (Test-Path -LiteralPath $resolvedPath)) {
-        return
-    }
-    $rootItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
-    $pending = [Collections.Generic.Stack[IO.FileSystemInfo]]::new()
-    $pending.Push($rootItem)
-    $visitedEntries = 1
-    while ($pending.Count -gt 0) {
-        $item = $pending.Pop()
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Name 的现有路径包含重解析点：$($item.FullName)"
-        }
-        if ($item.PSIsContainer) {
-            foreach ($childPath in [IO.Directory]::EnumerateFileSystemEntries(
-                    $item.FullName
-                )) {
-                $child = Get-Item `
-                    -LiteralPath $childPath `
-                    -Force `
-                    -ErrorAction Stop
-                $visitedEntries++
-                if ($visitedEntries -gt $MaximumEntries) {
-                    throw "$Name 的项目数量超过 $MaximumEntries 项限制：$resolvedPath"
-                }
-                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "$Name 的现有路径包含重解析点：$($child.FullName)"
-                }
-                if ($child.PSIsContainer) { $pending.Push($child) }
-            }
+            throw "$Label 包含重解析点：$($item.FullName)"
         }
     }
 }
 
-function Get-UninstallerRequiredStringProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$InputObject,
+function Get-ValidatedModulePackage {
+    param([Parameter(Mandatory = $true)] [string]$Root)
 
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $InputObject.PSObject.Properties[$Name]
-    if ($null -eq $property -or
-        [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-        throw "settings 缺少有效字段：$Name"
+    Assert-SafeDirectoryTree -Path $Root -Label 'PowerShell 模块目录'
+    $manifestPath = Join-Path $Root 'CodexOpenRouter.psd1'
+    $modulePath = Join-Path $Root 'CodexOpenRouter.psm1'
+    Assert-RegularFile -Path $manifestPath -Label '模块清单' -MaximumBytes 1MB
+    Assert-RegularFile -Path $modulePath -Label '模块文件' -MaximumBytes 5MB
+    $files = @(Get-ChildItem -LiteralPath $Root -Force -File)
+    $directories = @(Get-ChildItem -LiteralPath $Root -Force -Directory)
+    if ($directories.Count -ne 0 -or $files.Count -ne 2 -or
+        @($files.Name | Where-Object {
+                $_ -cnotin @('CodexOpenRouter.psd1', 'CodexOpenRouter.psm1')
+            }).Count -ne 0) {
+        throw "模块目录含有未知内容，已拒绝自动删除：$Root"
     }
-    return [string]$property.Value
-}
-
-function Assert-UninstallerReasoningEffort {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    Assert-ToolkitReasoningEffort -Value $Value -Name $Name
-    if (@(
-            'none',
-            'minimal',
-            'low',
-            'medium',
-            'high',
-            'xhigh',
-            'max',
-            'ultra'
-        ) -cnotcontains $Value) {
-        throw "$Name 的值不受支持：$Value"
+    try { $manifest = Import-PowerShellDataFile -LiteralPath $manifestPath }
+    catch { throw "模块清单无法解析：$($_.Exception.Message)" }
+    if ([string]$manifest.RootModule -cne 'CodexOpenRouter.psm1' -or
+        [string]$manifest.GUID -cne $script:ToolkitGuid) {
+        throw "模块身份校验失败，已拒绝自动删除：$Root"
+    }
+    return [pscustomobject]@{
+        Root = [IO.Path]::GetFullPath($Root)
+        ManifestPath = $manifestPath
+        ManifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+        ModuleHash = (Get-FileHash -LiteralPath $modulePath -Algorithm SHA256).Hash
     }
 }
 
-function Remove-UninstallerEnvironmentVariable {
+function Remove-ProfileCommentBlock {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [Parameter(Mandatory = $true)]
-        [EnvironmentVariableTarget]$Target
+        [Parameter(Mandatory = $true)] [AllowEmptyString()] [string]$Content,
+        [Parameter(Mandatory = $true)] [string]$StartMarker,
+        [Parameter(Mandatory = $true)] [string]$EndMarker,
+        [Parameter(Mandatory = $true)] [string]$Label
     )
 
-    $method = [Environment].GetMethod(
-        'SetEnvironmentVariable',
-        [type[]]@([string], [string], [EnvironmentVariableTarget])
+    $tokens = $null
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput(
+        $Content,
+        [ref]$tokens,
+        [ref]$parseErrors
     )
-    $arguments = [object[]]::new(3)
-    $arguments[0] = $Name
-    $arguments[1] = $null
-    $arguments[2] = $Target
+    if (@($parseErrors).Count -ne 0) {
+        throw "$Label 含有 PowerShell 语法错误，未修改。"
+    }
+    $comments = @($tokens | Where-Object {
+            $_.Kind -eq [Management.Automation.Language.TokenKind]::Comment
+        })
+    $starts = @($comments | Where-Object { $_.Text.Trim() -ceq $StartMarker })
+    $ends = @($comments | Where-Object { $_.Text.Trim() -ceq $EndMarker })
+    if ($starts.Count -eq 0 -and $ends.Count -eq 0) { return $Content }
+    if ($starts.Count -ne 1 -or $ends.Count -ne 1 -or
+        $starts[0].Extent.StartOffset -ge $ends[0].Extent.StartOffset) {
+        throw "$Label 的旧工具包标记不完整或重复，未修改。"
+    }
+    foreach ($token in @($starts[0], $ends[0])) {
+        $lineStart = $Content.LastIndexOf(
+            "`n",
+            [Math]::Max(0, $token.Extent.StartOffset - 1)
+        )
+        if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
+        $prefix = $Content.Substring(
+            $lineStart,
+            $token.Extent.StartOffset - $lineStart
+        )
+        if ($prefix -cnotmatch '\A[ \t]*\z') {
+            throw "$Label 的旧工具包标记必须独占一行，未修改。"
+        }
+    }
+    $removeStart = $Content.LastIndexOf(
+        "`n",
+        [Math]::Max(0, $starts[0].Extent.StartOffset - 1)
+    )
+    if ($removeStart -lt 0) { $removeStart = 0 } else { $removeStart++ }
+    $nextNewline = $Content.IndexOf("`n", $ends[0].Extent.EndOffset)
+    $removeEnd = if ($nextNewline -lt 0) {
+        $Content.Length
+    }
+    else {
+        $nextNewline + 1
+    }
+    return $Content.Remove($removeStart, $removeEnd - $removeStart)
+}
+
+function Get-ProfilePlan {
+    param([Parameter(Mandatory = $true)] [string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    Assert-RegularFile -Path $Path -Label 'PowerShell Profile' -MaximumBytes 5MB
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) { 3 } else { 0 }
     try {
-        [void]$method.Invoke($null, $arguments)
+        $content = [Text.UTF8Encoding]::new($false, $true).GetString(
+            $bytes,
+            $offset,
+            $bytes.Length - $offset
+        )
     }
-    catch {
-        $message = if ($_.Exception.InnerException) {
-            $_.Exception.InnerException.Message
-        }
-        else {
-            $_.Exception.Message
-        }
-        throw "无法删除环境变量 $Name（$Target）：$message"
+    catch { throw "PowerShell Profile 不是有效 UTF-8：$Path" }
+    $updated = $content
+    for ($index = 0; $index -lt $script:ProfileStartMarkers.Count; $index++) {
+        $updated = Remove-ProfileCommentBlock `
+            -Content $updated `
+            -StartMarker $script:ProfileStartMarkers[$index] `
+            -EndMarker $script:ProfileEndMarkers[$index] `
+            -Label $Path
+    }
+    if ($updated -ceq $content) { return $null }
+    return [pscustomobject]@{
+        Path = $Path
+        InitialHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($bytes)
+        )
+        Content = $updated
     }
 }
 
-function Test-UninstallerSnapshotEquivalent {
+function Get-LegacyInstallInfo {
     param(
-        [Parameter(Mandatory = $true)]
-        [object]$Expected,
-
-        [Parameter(Mandatory = $true)]
-        [object]$Actual
+        [Parameter(Mandatory = $true)] [string]$Root,
+        [Parameter(Mandatory = $true)] [string]$ExpectedCodexHome
     )
 
-    if ([DateTime]$Expected.CreationTimeUtc -ne
-            [DateTime]$Actual.CreationTimeUtc -or
-        [DateTime]$Expected.LastWriteTimeUtc -ne
-            [DateTime]$Actual.LastWriteTimeUtc -or
-        -not [Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
-            [byte[]]$Expected.Bytes,
-            [byte[]]$Actual.Bytes
-        )) {
-        return $false
+    if (-not (Test-Path -LiteralPath $Root)) { return $null }
+    Assert-SafeDirectoryTree -Path $Root -Label '旧版工具包安装' -MaximumEntries 64
+    $settingsPath = Join-Path $Root 'settings.json'
+    $manifestPath = Join-Path $Root 'CodexOpenRouter\CodexOpenRouter.psd1'
+    Assert-RegularFile -Path $settingsPath -Label '旧版 settings' -MaximumBytes 1MB
+    Assert-RegularFile -Path $manifestPath -Label '旧版模块清单' -MaximumBytes 1MB
+    try {
+        $settings = [IO.File]::ReadAllText(
+            $settingsPath,
+            [Text.UTF8Encoding]::new($false, $true)
+        ) | ConvertFrom-Json -ErrorAction Stop
+        $manifest = Import-PowerShellDataFile -LiteralPath $manifestPath
     }
-    if ($IsWindows) {
-        return (Test-ToolkitAclPolicyEquivalent `
-                -ExpectedAcl $Expected.Acl `
-                -ActualAcl $Actual.Acl) -and
-            (Test-ToolkitEffectiveFileAclEquivalent `
-                -SourceAcl $Expected.Acl `
-                -DestinationAcl $Actual.Acl)
+    catch { throw "旧版安装无法验证：$($_.Exception.Message)" }
+    if ([string]$manifest.GUID -cne $script:ToolkitGuid -or
+        [string]$manifest.RootModule -cne 'CodexOpenRouter.psm1') {
+        throw '旧版安装身份无效，已拒绝自动删除。'
     }
-    return $true
+    $recordedHome = Resolve-AbsolutePath `
+        -Path ([string]$settings.CodexHome) `
+        -Label '旧版 settings.CodexHome'
+    if (-not (Test-PathEqual -Left $recordedHome -Right $ExpectedCodexHome)) {
+        throw '旧版安装记录的 CodexHome 与当前目标不一致。'
+    }
+    $recordedProfile = Resolve-AbsolutePath `
+        -Path ([string]$settings.ProfilePath) `
+        -Label '旧版 settings.ProfilePath'
+    if ([IO.Path]::GetExtension($recordedProfile) -cne '.ps1') {
+        throw '旧版安装记录的 ProfilePath 无效。'
+    }
+    $digestLines = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force |
+        Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($Root, $_.FullName)
+            "$relative|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+        })
+    $digestBytes = [Text.Encoding]::UTF8.GetBytes($digestLines -join "`n")
+    return [pscustomobject]@{
+        Root = [IO.Path]::GetFullPath($Root)
+        ProfilePath = $recordedProfile
+        Digest = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($digestBytes)
+        )
+    }
 }
 
-$codexHomeSpecified = $PSBoundParameters.ContainsKey('CodexHome')
-$profilePathSpecified = $PSBoundParameters.ContainsKey('ProfilePath')
-if ($codexHomeSpecified -and [string]::IsNullOrWhiteSpace($CodexHome)) {
-    throw '显式传入的 CodexHome 不能为空。'
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$documents = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::MyDocuments
+)
+if ([string]::IsNullOrWhiteSpace($documents)) {
+    throw '无法定位当前用户的 Documents 目录。'
 }
-if ($profilePathSpecified -and [string]::IsNullOrWhiteSpace($ProfilePath)) {
-    throw '显式传入的 ProfilePath 不能为空。'
+$moduleRoot = Join-Path $documents 'PowerShell\Modules\CodexOpenRouter'
+$installedPackage = if (Test-Path -LiteralPath $moduleRoot) {
+    Get-ValidatedModulePackage -Root $moduleRoot
 }
+else { $null }
 
 if ([string]::IsNullOrWhiteSpace($CodexHome)) {
-    $CodexHome = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
-        $env:CODEX_HOME
+    $userCodexHome = [Environment]::GetEnvironmentVariable(
+        'CODEX_HOME',
+        [EnvironmentVariableTarget]::User
+    )
+    $CodexHome = if (-not [string]::IsNullOrWhiteSpace($userCodexHome)) {
+        $userCodexHome
     }
     else {
         Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'
     }
 }
-$resolvedCodexHome = Get-UninstallerAbsolutePath `
-    -Path $CodexHome `
-    -Name 'CodexHome'
-$volumeRoot = [IO.Path]::GetPathRoot($resolvedCodexHome).
-    TrimEnd([IO.Path]::DirectorySeparatorChar)
-if ($resolvedCodexHome.TrimEnd([IO.Path]::DirectorySeparatorChar) -ceq
-    $volumeRoot) {
+$resolvedCodexHome = Resolve-AbsolutePath -Path $CodexHome -Label 'CodexHome'
+$volumeRoot = [IO.Path]::GetPathRoot($resolvedCodexHome)
+if (Test-PathEqual -Left $resolvedCodexHome -Right $volumeRoot) {
     throw 'CodexHome 不能是卷根目录。'
 }
-if (-not (Test-Path -LiteralPath $resolvedCodexHome -PathType Container)) {
-    throw "找不到 CodexHome：$resolvedCodexHome"
-}
-Assert-UninstallerNoReparsePoint -Path $resolvedCodexHome -Name 'CodexHome'
-
-if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
-    $ProfilePath = [string]$PROFILE.CurrentUserCurrentHost
-}
-$requestedProfilePath = Get-UninstallerAbsolutePath `
-    -Path $ProfilePath `
-    -Name 'ProfilePath'
-if ([IO.Path]::GetExtension($requestedProfilePath) -cne '.ps1') {
-    throw 'ProfilePath 必须指向 .ps1 文件。'
-}
-Assert-UninstallerNoReparsePoint `
-    -Path $requestedProfilePath `
-    -Name 'ProfilePath'
-
-$installRoot = Join-Path $resolvedCodexHome 'codex-openrouter-toolkit'
-$settingsPath = Join-Path $installRoot 'settings.json'
-$installedModuleManifest = Join-Path `
-    $installRoot `
-    'CodexOpenRouter\CodexOpenRouter.psd1'
-$sourceModuleManifest = Join-Path `
-    $repositoryRoot `
-    'src\CodexOpenRouter\CodexOpenRouter.psd1'
-$mutex = Enter-ToolkitMutex -ScopePath $resolvedCodexHome
-try {
-if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
-    throw "找不到工具包安装目录：$installRoot"
-}
-Assert-UninstallerNoReparsePoint `
-    -Path $installRoot `
-    -Name '工具包安装目录' `
-    -Recurse `
-    -MaximumEntries 1024
-if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
-    throw "找不到已安装的工具包设置：$settingsPath"
-}
-Assert-UninstallerNoReparsePoint -Path $settingsPath -Name 'settings'
-
-try {
-    $settingsSnapshot = Get-ToolkitFileSnapshot `
-        -Path $settingsPath `
-        -MaximumBytes 5MB
-    $settingsText = ConvertFrom-UninstallerUtf8Bytes `
-        -Bytes $settingsSnapshot.Bytes `
-        -Label 'settings'
-    $settings = $settingsText | ConvertFrom-Json
-}
-catch {
-    throw "settings 无法解析：$($_.Exception.Message)"
-}
-$schemaProperty = $settings.PSObject.Properties['SchemaVersion']
-if ($null -eq $schemaProperty -or
-    [int]$schemaProperty.Value -notin @(1, 2)) {
-    throw 'settings 的 SchemaVersion 不受支持。'
-}
-if ([int]$schemaProperty.Value -eq 2) {
-    $toolkit = Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'Toolkit'
-    if ($toolkit -cne 'codex-openrouter-toolkit') {
-        throw 'settings 的 Toolkit 标识不匹配。'
-    }
-    $recordedInstallRoot = Get-UninstallerAbsolutePath `
-        -Path (Get-UninstallerRequiredStringProperty `
-            -InputObject $settings `
-            -Name 'InstallRoot') `
-        -Name 'settings.InstallRoot'
-    if (-not (Test-ToolkitPathEqual `
-            -Left $recordedInstallRoot `
-            -Right $installRoot)) {
-        throw 'settings 的 InstallRoot 与固定安装目录不匹配。'
+$configPath = Join-Path $resolvedCodexHome 'config.toml'
+$catalogPath = Join-Path $resolvedCodexHome 'openrouter-model-catalog.json'
+foreach ($managedFile in @($configPath, $catalogPath)) {
+    if (Test-Path -LiteralPath $managedFile) {
+        Assert-RegularFile -Path $managedFile -Label '受管 Codex 文件' -MaximumBytes 50MB
     }
 }
 
-$recordedCodexHome = Get-UninstallerAbsolutePath `
-    -Path (Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'CodexHome') `
-    -Name 'settings.CodexHome'
-if (-not (Test-ToolkitPathEqual `
-        -Left $recordedCodexHome `
-        -Right $resolvedCodexHome)) {
-    throw 'settings 的 CodexHome 与卸载目标不匹配。'
-}
+$legacyRoot = Join-Path $resolvedCodexHome 'codex-openrouter-toolkit'
+$legacyInfo = Get-LegacyInstallInfo `
+    -Root $legacyRoot `
+    -ExpectedCodexHome $resolvedCodexHome
 
-$fixedPaths = [ordered]@{
-    ConfigPath = Join-Path $resolvedCodexHome 'config.toml'
-    CatalogPath = Join-Path $resolvedCodexHome 'openrouter-model-catalog.json'
-    ActiveCachePath = Join-Path $resolvedCodexHome 'models_cache.json'
-    OpenAICachePath = Join-Path $resolvedCodexHome 'models_cache.openai.json'
+$defaultProfile = Resolve-AbsolutePath `
+    -Path ([string]$PROFILE.CurrentUserCurrentHost) `
+    -Label 'PowerShell Profile'
+$requestedProfile = if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+    $null
 }
-foreach ($entry in $fixedPaths.GetEnumerator()) {
-    $actual = Get-UninstallerAbsolutePath `
-        -Path (Get-UninstallerRequiredStringProperty `
-            -InputObject $settings `
-            -Name $entry.Key) `
-        -Name "settings.$($entry.Key)"
-    if (-not (Test-ToolkitPathEqual -Left $actual -Right $entry.Value)) {
-        throw "settings 的 $($entry.Key) 超出固定路径。"
+else {
+    $resolved = Resolve-AbsolutePath -Path $ProfilePath -Label 'ProfilePath'
+    if ([IO.Path]::GetExtension($resolved) -cne '.ps1') {
+        throw 'ProfilePath 必须指向 .ps1 文件。'
     }
-    Assert-UninstallerNoReparsePoint `
-        -Path $actual `
-        -Name "settings.$($entry.Key)"
+    $resolved
 }
-
-$recordedProfilePath = Get-UninstallerAbsolutePath `
-    -Path (Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'ProfilePath') `
-    -Name 'settings.ProfilePath'
-if ([IO.Path]::GetExtension($recordedProfilePath) -cne '.ps1') {
-    throw 'settings.ProfilePath 必须指向 .ps1 文件。'
-}
-Assert-UninstallerNoReparsePoint `
-    -Path $recordedProfilePath `
-    -Name 'settings.ProfilePath'
-if (-not (Test-ToolkitPathEqual `
-        -Left $recordedProfilePath `
-        -Right $requestedProfilePath)) {
-    throw 'settings.ProfilePath 与本次卸载指定的 ProfilePath 不匹配。'
-}
-$profilePath = $requestedProfilePath
-
-if (-not $KeepCurrentProvider) {
-    $openAIModel = Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'OpenAIModel'
-    $openAIReasoning = Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'OpenAIReasoningEffort'
-    $openRouterModel = Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'OpenRouterModel'
-    $openRouterReasoning = Get-UninstallerRequiredStringProperty `
-        -InputObject $settings `
-        -Name 'OpenRouterReasoningEffort'
-    Assert-ToolkitModelId -Value $openAIModel -Name 'settings.OpenAIModel'
-    Assert-UninstallerReasoningEffort `
-        -Value $openAIReasoning `
-        -Name 'settings.OpenAIReasoningEffort'
-    Assert-ToolkitModelId -Value $openRouterModel -Name 'settings.OpenRouterModel'
-    Assert-UninstallerReasoningEffort `
-        -Value $openRouterReasoning `
-        -Name 'settings.OpenRouterReasoningEffort'
-    $catalogAgeProperty =
-        $settings.PSObject.Properties['CatalogMaximumAgeHours']
-    if ($null -eq $catalogAgeProperty -or
-        [int]$catalogAgeProperty.Value -lt 1 -or
-        [int]$catalogAgeProperty.Value -gt 8760) {
-        throw 'settings.CatalogMaximumAgeHours 超出范围。'
+$profilePaths = [Collections.Generic.List[string]]::new()
+foreach ($candidate in @(
+        $defaultProfile,
+        $requestedProfile,
+        $(if ($legacyInfo) { $legacyInfo.ProfilePath } else { $null })
+    )) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    if (-not ($profilePaths | Where-Object {
+                Test-PathEqual -Left $_ -Right $candidate
+            })) {
+        $profilePaths.Add($candidate)
     }
 }
+$profilePlans = @($profilePaths | ForEach-Object { Get-ProfilePlan -Path $_ } |
+        Where-Object { $null -ne $_ })
 
-if (-not (Test-Path -LiteralPath $installedModuleManifest -PathType Leaf)) {
-    throw "找不到已安装模块：$installedModuleManifest"
+$sourceRoot = Join-Path $repositoryRoot 'src\CodexOpenRouter'
+$sourcePackage = if (Test-Path -LiteralPath $sourceRoot -PathType Container) {
+    Get-ValidatedModulePackage -Root $sourceRoot
 }
-Assert-UninstallerNoReparsePoint `
-    -Path $installedModuleManifest `
-    -Name '已安装模块'
-if ((Get-Item `
-        -LiteralPath $installedModuleManifest `
-        -Force `
-        -ErrorAction Stop).Length -gt 25MB) {
-    throw "已安装模块清单超过 26214400 字节限制：$installedModuleManifest"
+else { $null }
+if (-not $sourcePackage) {
+    throw '找不到可用于安全清理配置的 CodexOpenRouter 0.1.2 模块。'
 }
-try {
-    $installedModuleRead = Import-ToolkitPowerShellDataFileLocked `
-        -Path $installedModuleManifest `
-        -MaximumBytes 5MB
-    $installedModuleData = $installedModuleRead.Data
+$sourceData = Import-PowerShellDataFile -LiteralPath $sourcePackage.ManifestPath
+$sourceExports = @($sourceData.FunctionsToExport)
+if ([version]$sourceData.ModuleVersion -ne [version]'0.1.2' -or
+    $sourceExports.Count -ne 2 -or
+    $sourceExports -cnotcontains 'cx' -or
+    $sourceExports -cnotcontains 'cxor') {
+    throw '配置清理模块必须是 0.1.2，且只能导出 cx 与 cxor。'
 }
-catch {
-    throw "已安装模块清单无法解析：$($_.Exception.Message)"
-}
-if ([string]$installedModuleData.RootModule -cne 'CodexOpenRouter.psm1' -or
-    [string]$installedModuleData.GUID -cne
-        'be74dba0-28ed-4ba3-adff-f0fc0d107b39') {
-    throw '已安装模块清单身份无效。'
-}
-if (-not $KeepCurrentProvider) {
-    if (-not (Test-Path -LiteralPath $sourceModuleManifest -PathType Leaf)) {
-        throw "找不到卸载器随附模块：$sourceModuleManifest"
-    }
-    Assert-UninstallerNoReparsePoint `
-        -Path $sourceModuleManifest `
-        -Name '卸载器随附模块'
-    Assert-UninstallerNoReparsePoint `
-        -Path (Split-Path -Parent $sourceModuleManifest) `
-        -Name '卸载器随附模块目录' `
-        -Recurse `
-        -MaximumEntries 1024
-    $sourceModuleRoot = Split-Path -Parent $sourceModuleManifest
-    $sourceModuleTotalBytes = 0L
-    foreach ($sourceModulePath in @(Get-ToolkitSafeDirectoryTreePaths `
-            -Root $sourceModuleRoot `
-            -MaximumEntries 1024)) {
-        $sourceModuleItem = Get-Item `
-            -LiteralPath $sourceModulePath `
-            -Force `
-            -ErrorAction Stop
-        if ($sourceModuleItem.PSIsContainer) { continue }
-        $sourceModuleSnapshot = Get-ToolkitFileSnapshot `
-            -Path $sourceModulePath `
-            -MaximumBytes 25MB
-        $sourceModuleTotalBytes += [long]$sourceModuleSnapshot.Length
-        if ($sourceModuleTotalBytes -gt 64MB) {
-            throw '卸载器随附模块目录文件总大小超过 67108864 字节限制。'
-        }
-    }
-}
+$moduleManifest = $sourcePackage.ManifestPath
 
 if (-not $PSCmdlet.ShouldProcess(
-        "$installRoot、$profilePath 和 $($fixedPaths.ConfigPath)",
+        "$moduleRoot、$configPath 与 $catalogPath",
         '卸载 Codex OpenRouter Toolkit'
     )) {
     return
 }
 
-    $timestamp = (Get-Date -Format 'yyyyMMdd-HHmmssfff') + '-' +
-        [Guid]::NewGuid().ToString('N')
-    $uninstallRoot = Join-Path `
-        $resolvedCodexHome `
-        'codex-openrouter-toolkit-uninstalled'
-    [void](New-Item -ItemType Directory -Path $uninstallRoot -Force)
-    Assert-UninstallerNoReparsePoint `
-        -Path $uninstallRoot `
-        -Name '卸载恢复根目录'
-    $uninstallBackup = Join-Path $uninstallRoot $timestamp
-    [void](New-Item -ItemType Directory -Path $uninstallBackup)
-    Set-ToolkitPrivateDirectoryTree -Root $uninstallBackup
-    Set-ToolkitPrivateDirectoryTree -Root $installRoot
-    $installProduct = Get-ToolkitDirectoryStateSnapshot `
-        -Root $installRoot `
-        -MaximumFileBytes 25MB `
-        -MaximumEntries 1024 `
-        -MaximumTotalBytes 64MB
-    Assert-ToolkitDirectorySnapshotContainsFileSnapshot `
-        -DirectorySnapshot $installProduct `
-        -RelativePath 'CodexOpenRouter\CodexOpenRouter.psd1' `
-        -FileSnapshot $installedModuleRead.Snapshot `
-        -Label '已安装模块清单'
+$module = Import-Module -Name $moduleManifest -Force -PassThru -ErrorAction Stop
+$configChanged = $false
+$mutex = $null
+try {
+    $mutex = & $module { param($TargetPath) Enter-CxMutex $TargetPath } $configPath
+    $configChange = & $module {
+        param($TargetPath)
+        Get-CxConfigChange -Path $TargetPath -Mode Default
+    } $configPath
+    $configChanged = [string]$configChange.Content -cne
+        [string]$configChange.OriginalContent
 
-    $recoveryFiles = @(
-        [pscustomobject]@{
-            Name = 'profile'
-            Target = $profilePath
-            BackupRelativePath = 'profile-before-uninstall.bak'
-            MaximumBytes = 5MB
-        },
-        [pscustomobject]@{
-            Name = 'config'
-            Target = [string]$fixedPaths.ConfigPath
-            BackupRelativePath = 'config-before-uninstall.bak'
-            MaximumBytes = 5MB
-        },
-        [pscustomobject]@{
-            Name = 'active-cache'
-            Target = [string]$fixedPaths.ActiveCachePath
-            BackupRelativePath = 'active-cache-before-uninstall.bak'
-            MaximumBytes = 50MB
-        },
-        [pscustomobject]@{
-            Name = 'openai-cache'
-            Target = [string]$fixedPaths.OpenAICachePath
-            BackupRelativePath = 'openai-cache-before-uninstall.bak'
-            MaximumBytes = 50MB
+    foreach ($plan in $profilePlans) {
+        $currentBytes = [IO.File]::ReadAllBytes($plan.Path)
+        $currentHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($currentBytes)
+        )
+        if ($currentHash -cne $plan.InitialHash) {
+            throw "PowerShell Profile 在卸载期间被外部修改：$($plan.Path)"
         }
-    )
-    $recoveryEntries = [Collections.Generic.List[object]]::new()
-    $originalRecoverySnapshots = @{}
-    foreach ($file in $recoveryFiles) {
-        $existed = Test-Path -LiteralPath $file.Target -PathType Leaf
-        $sha256 = $null
-        $aclSddl = $null
-        $lastWriteTimeUtc = $null
-        if ($existed) {
-            $sourceSnapshot = Get-ToolkitFileSnapshot `
-                -Path $file.Target `
-                -MaximumBytes ([long]$file.MaximumBytes)
-            $originalRecoverySnapshots[[IO.Path]::GetFullPath(
-                    $file.Target
-                )] = $sourceSnapshot
-            $aclSddl = $sourceSnapshot.AclSddl
-            $backupFile = Join-Path `
-                $uninstallBackup `
-                $file.BackupRelativePath
-            Write-ToolkitBytesAtomic `
-                -Path $backupFile `
-                -Bytes $sourceSnapshot.Bytes `
-                -TargetLastWriteTimeUtc $sourceSnapshot.LastWriteTimeUtc `
-                -MaximumBytes ([long]$file.MaximumBytes) `
-                -RequireNewTarget
-            Assert-ToolkitPrivateFileSystemAcl -Path $backupFile
-            $sha256 = $sourceSnapshot.Sha256.ToUpperInvariant()
-            $lastWriteTimeUtc = $sourceSnapshot.LastWriteTimeUtc
-        }
-        else {
-            $originalRecoverySnapshots[[IO.Path]::GetFullPath(
-                    $file.Target
-                )] = $null
-        }
-        $recoveryEntries.Add([pscustomobject]@{
-            Name = $file.Name
-            Target = $file.Target
-            Existed = $existed
-            BackupRelativePath = $file.BackupRelativePath
-            Sha256 = $sha256
-            AclSddl = $aclSddl
-            LastWriteTimeUtc = $lastWriteTimeUtc
-        })
+        & $module {
+            param($TargetPath, $TargetContent)
+            Write-CxTextFileAtomic -Path $TargetPath -Content $TargetContent
+        } $plan.Path $plan.Content
     }
-    Write-ToolkitUtf8FileAtomic `
-        -Path (Join-Path $uninstallBackup 'recovery.json') `
-        -Content ([pscustomobject]@{
-            Toolkit = 'codex-openrouter-toolkit'
-            SchemaVersion = 2
-            CreatedAt = [DateTimeOffset]::Now.ToString('o')
-            CodexHome = $resolvedCodexHome
-            ProfilePath = $profilePath
-            Files = @($recoveryEntries)
-        } | ConvertTo-Json -Depth 10) `
-        -MaximumBytes 5MB
-
-    $installMoved = $false
-    $movedInstallProduct = $null
-    $installMoveState = [ordered]@{ Disposition = 'NoMove' }
-    $transactionProducts = @{}
-    try {
-        Assert-ToolkitPrivateDirectoryTree -Root $installRoot
-        if (-not $KeepCurrentProvider) {
-            Import-Module -Name $sourceModuleManifest -Force
-            foreach ($transactionPath in @(
-                    [string]$fixedPaths.ConfigPath,
-                    [string]$fixedPaths.ActiveCachePath,
-                    [string]$fixedPaths.OpenAICachePath
-                )) {
-                $originalSnapshot =
-                    $originalRecoverySnapshots[[IO.Path]::GetFullPath(
-                            $transactionPath
-                        )]
-                if (($null -eq $originalSnapshot -and
-                        (Test-Path -LiteralPath $transactionPath)) -or
-                    ($null -ne $originalSnapshot -and
-                        -not (Test-ToolkitFileMatchesSnapshot `
-                            -Path $transactionPath `
-                            -Snapshot $originalSnapshot))) {
-                    throw "受管文件在卸载事务首次写入前被外部修改：$transactionPath"
-                }
+    & $module { param($Change) Commit-CxConfigChange $Change } $configChange
+    $catalogRemoved = $false
+    if (Test-Path -LiteralPath $catalogPath -PathType Leaf) {
+        $catalogHash = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
+        $catalogQuarantine = Join-Path $resolvedCodexHome (
+            '.openrouter-model-catalog.remove-{0}-{1}.json' -f `
+                $PID, [guid]::NewGuid().ToString('N')
+        )
+        try {
+            [IO.File]::Move($catalogPath, $catalogQuarantine)
+            if ((Get-FileHash -LiteralPath $catalogQuarantine -Algorithm SHA256).Hash -cne
+                $catalogHash) {
+                throw '模型目录在卸载移动期间发生变化。'
             }
-            $switchResult = Switch-CodexDesktopProvider `
-                -Provider openai `
-                -NoRestart `
-                -SettingsPath $settingsPath `
-                -PassThruMutations
-            $allowedSwitchPaths = @{}
-            foreach ($transactionPath in @(
-                    [string]$fixedPaths.ConfigPath,
-                    [string]$fixedPaths.ActiveCachePath,
-                    [string]$fixedPaths.OpenAICachePath
-                )) {
-                $allowedSwitchPaths[[IO.Path]::GetFullPath($transactionPath)] =
-                    $true
-            }
-            foreach ($mutation in @($switchResult.Mutations)) {
-                $transactionPath = [IO.Path]::GetFullPath(
-                    [string]$mutation.Path
-                )
-                if (-not $allowedSwitchPaths.ContainsKey($transactionPath) -or
-                    -not (Test-ToolkitPathEqual `
-                        -Left ([string]$mutation.InitialState.Path) `
-                        -Right $transactionPath) -or
-                    -not (Test-ToolkitPathEqual `
-                        -Left ([string]$mutation.PostState.Path) `
-                        -Right $transactionPath)) {
-                    throw "供应商切换返回了越界事务路径：$transactionPath"
-                }
-                $transactionProducts[$transactionPath] = $mutation
-            }
-            foreach ($mutation in @($switchResult.Mutations)) {
-                $transactionPath = [IO.Path]::GetFullPath(
-                    [string]$mutation.Path
-                )
-                $originalSnapshot =
-                    $originalRecoverySnapshots[$transactionPath]
-                $initialMatches = if ($null -eq $originalSnapshot) {
-                    -not [bool]$mutation.InitialState.Existed
-                }
-                else {
-                    [bool]$mutation.InitialState.Existed -and
-                        $null -ne $mutation.InitialState.Snapshot -and
-                        (Test-UninstallerSnapshotEquivalent `
-                            -Expected $originalSnapshot `
-                            -Actual $mutation.InitialState.Snapshot)
-                }
-                if (-not $initialMatches) {
-                    throw "受管文件在卸载事务内部采样前被外部修改：$transactionPath"
-                }
-            }
+            Remove-Item -LiteralPath $catalogQuarantine -Force
+            $catalogRemoved = $true
         }
-
-        if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
-            $originalProfileSnapshot =
-                $originalRecoverySnapshots[[IO.Path]::GetFullPath($profilePath)]
-            if ($null -eq $originalProfileSnapshot -or
-                -not (Test-ToolkitFileMatchesSnapshot `
-                    -Path $profilePath `
-                    -Snapshot $originalProfileSnapshot)) {
-                throw 'Profile 在卸载事务首次写入前被外部修改。'
+        catch {
+            if ((Test-Path -LiteralPath $catalogQuarantine -PathType Leaf) -and
+                -not (Test-Path -LiteralPath $catalogPath) -and
+                (Get-FileHash -LiteralPath $catalogQuarantine -Algorithm SHA256).Hash -ceq
+                    $catalogHash) {
+                try { [IO.File]::Move($catalogQuarantine, $catalogPath) } catch { }
             }
-            $profileContent = ConvertFrom-UninstallerUtf8Bytes `
-                -Bytes $originalProfileSnapshot.Bytes `
-                -Label 'Profile'
-            $newProfileContent = (Remove-ToolkitPowerShellCommentBlock `
-                -Content $profileContent `
-                -StartMarker '# >>> codex-openrouter-toolkit >>>' `
-                -EndMarker '# <<< codex-openrouter-toolkit <<<' `
-                -Context 'PowerShell Profile').TrimEnd()
-            if (-not [string]::IsNullOrEmpty($newProfileContent)) {
-                $newProfileContent += "`r`n"
-            }
-            $tokens = $null
-            $parseErrors = $null
-            [void][Management.Automation.Language.Parser]::ParseInput(
-                $newProfileContent,
-                [ref]$tokens,
-                [ref]$parseErrors
-            )
-            if ($parseErrors.Count -ne 0) {
-                throw "卸载后的 PowerShell Profile 有 $($parseErrors.Count) 个语法错误。"
-            }
-            $profileWriteParameters = @{
-                Path = $profilePath
-                Content = $newProfileContent
-                ExpectedCurrentBytes = $originalProfileSnapshot.Bytes
-                ExpectedCurrentLastWriteTimeUtc =
-                    $originalProfileSnapshot.LastWriteTimeUtc
-                RequireExistingTarget = $true
-                PassThru = $true
-                MaximumBytes = 5MB
-            }
-            if ($IsWindows) {
-                $profileWriteParameters.ExpectedCurrentAcl =
-                    $originalProfileSnapshot.Acl
-            }
-            $profileProduct = Write-ToolkitUtf8FileAtomic `
-                @profileWriteParameters
-            $transactionProducts[[IO.Path]::GetFullPath($profilePath)] =
-                [pscustomobject]@{
-                    Path = [IO.Path]::GetFullPath($profilePath)
-                    InitialState = [pscustomobject]@{
-                        Path = [IO.Path]::GetFullPath($profilePath)
-                        Existed = $true
-                        Snapshot = $originalProfileSnapshot
-                    }
-                    PostState = [pscustomobject]@{
-                        Path = [IO.Path]::GetFullPath($profilePath)
-                        Existed = $true
-                        Snapshot = $profileProduct
-                    }
-                }
-        }
-
-        Remove-Module CodexOpenRouter -Force -ErrorAction SilentlyContinue
-        Assert-UninstallerNoReparsePoint `
-            -Path $installRoot `
-            -Name '待移走安装目录'
-        $movedInstall = Join-Path $uninstallBackup 'installed-files'
-        if (Test-Path -LiteralPath $movedInstall) {
-            throw "卸载恢复目录已被占用：$movedInstall"
-        }
-        Move-ToolkitDirectoryIfSnapshotMatches `
-            -Path $installRoot `
-            -Destination $movedInstall `
-            -Snapshot $installProduct `
-            -State $installMoveState
-        $installMoved = $true
-        $movedInstallProduct = $installProduct
-        if (Test-Path -LiteralPath $installRoot) {
-            throw '安装目录在卸载移动后被外部重新创建。'
+            throw
         }
     }
-    catch {
-        $originalError = $_
-        $rollbackErrors = [Collections.Generic.List[string]]::new()
-        Remove-Module CodexOpenRouter -Force -ErrorAction SilentlyContinue
 
-        if (-not $installMoved -and
-            [string]$installMoveState['Disposition'] -notin @(
-                'NoMove',
-                'RevertedToSource'
-            )) {
-            $rollbackErrors.Add(
-                "安装目录移动状态未完成验证，恢复候选已保留：$movedInstall"
-            )
+    $moduleRemoved = $false
+    if ($installedPackage -and (Test-Path -LiteralPath $moduleRoot -PathType Container)) {
+        $moduleQuarantine = Join-Path (Split-Path -Parent $moduleRoot) (
+            '.CodexOpenRouter.remove-{0}-{1}' -f $PID, [guid]::NewGuid().ToString('N')
+        )
+        try {
+            [IO.Directory]::Move($moduleRoot, $moduleQuarantine)
+            $movedPackage = Get-ValidatedModulePackage -Root $moduleQuarantine
+            if ($movedPackage.ManifestHash -cne $installedPackage.ManifestHash -or
+                $movedPackage.ModuleHash -cne $installedPackage.ModuleHash) {
+                throw '模块在卸载移动期间发生变化。'
+            }
+            Remove-Item -LiteralPath $moduleQuarantine -Recurse -Force
+            $moduleRemoved = $true
         }
+        catch {
+            $failure = $_.Exception.Message
+            $restored = $false
+            if ((Test-Path -LiteralPath $moduleQuarantine -PathType Container) -and
+                -not (Test-Path -LiteralPath $moduleRoot)) {
+                try {
+                    $remaining = Get-ValidatedModulePackage -Root $moduleQuarantine
+                    if ($remaining.ManifestHash -ceq $installedPackage.ManifestHash -and
+                        $remaining.ModuleHash -ceq $installedPackage.ModuleHash) {
+                        [IO.Directory]::Move($moduleQuarantine, $moduleRoot)
+                        $restored = $true
+                    }
+                }
+                catch { $restored = $false }
+            }
+            if (-not $restored -and
+                (Test-Path -LiteralPath $moduleQuarantine -PathType Container)) {
+                throw "模块删除未完成；残留保留在 $moduleQuarantine。$failure"
+            }
+            throw
+        }
+    }
 
-        if ($installMoved) {
-            try {
-                $movedInstall = Join-Path $uninstallBackup 'installed-files'
-                $rollbackInstallMoveState = [ordered]@{}
-                Move-ToolkitDirectoryIfSnapshotMatches `
-                    -Path $movedInstall `
-                    -Destination $installRoot `
-                    -Snapshot $movedInstallProduct `
-                    -State $rollbackInstallMoveState
-                Assert-ToolkitPrivateDirectoryTree -Root $installRoot
+    $legacyRemoved = $false
+    if ($legacyInfo -and (Test-Path -LiteralPath $legacyInfo.Root -PathType Container)) {
+        $legacyQuarantine = Join-Path $resolvedCodexHome (
+            '.codex-openrouter-toolkit.remove-{0}-{1}' -f `
+                $PID, [guid]::NewGuid().ToString('N')
+        )
+        try {
+            [IO.Directory]::Move($legacyInfo.Root, $legacyQuarantine)
+            $movedLegacy = Get-LegacyInstallInfo `
+                -Root $legacyQuarantine `
+                -ExpectedCodexHome $resolvedCodexHome
+            if ($movedLegacy.Digest -cne $legacyInfo.Digest) {
+                throw '旧版安装在卸载移动期间发生变化。'
             }
-            catch {
-                $rollbackErrors.Add("安装目录：$($_.Exception.Message)")
-            }
+            Remove-Item -LiteralPath $legacyQuarantine -Recurse -Force
+            $legacyRemoved = $true
         }
-        foreach ($entry in $recoveryEntries) {
-            try {
-                $transactionTarget = [IO.Path]::GetFullPath($entry.Target)
-                if (-not $transactionProducts.ContainsKey($transactionTarget)) {
-                    continue
-                }
-                $transactionProduct = $transactionProducts[$transactionTarget]
-                $postState = $transactionProduct.PostState
-                if ([bool]$postState.Existed) {
-                    if ($null -eq $postState.Snapshot -or
-                        -not (Test-ToolkitFileMatchesSnapshot `
-                            -Path $entry.Target `
-                            -Snapshot $postState.Snapshot)) {
-                        throw "回滚 CAS 冲突，保留外部修改：$($entry.Target)"
+        catch {
+            $failure = $_.Exception.Message
+            $restored = $false
+            if ((Test-Path -LiteralPath $legacyQuarantine -PathType Container) -and
+                -not (Test-Path -LiteralPath $legacyInfo.Root)) {
+                try {
+                    $remainingLegacy = Get-LegacyInstallInfo `
+                        -Root $legacyQuarantine `
+                        -ExpectedCodexHome $resolvedCodexHome
+                    if ($remainingLegacy.Digest -ceq $legacyInfo.Digest) {
+                        [IO.Directory]::Move($legacyQuarantine, $legacyInfo.Root)
+                        $restored = $true
                     }
                 }
-                elseif (Test-Path -LiteralPath $entry.Target) {
-                    throw "回滚 CAS 冲突，保留外部新建：$($entry.Target)"
-                }
-                $initialState = $transactionProduct.InitialState
-                if ([bool]$initialState.Existed) {
-                    if ($null -eq $initialState.Snapshot) {
-                        throw "事务初始快照缺失：$($entry.Target)"
-                    }
-                    $rollbackParameters = @{
-                        Path = $entry.Target
-                        Bytes = $initialState.Snapshot.Bytes
-                        TargetLastWriteTimeUtc =
-                            [DateTime]$initialState.Snapshot.LastWriteTimeUtc
-                        MaximumBytes = if ($null -ne
-                            $initialState.Snapshot.PSObject.Properties[
-                                'MaximumBytes'
-                            ]) {
-                            [long]$initialState.Snapshot.MaximumBytes
-                        }
-                        else {
-                            [Math]::Max(
-                                1,
-                                [long]$initialState.Snapshot.Bytes.LongLength
-                            )
-                        }
-                    }
-                    if ([bool]$postState.Existed) {
-                        $rollbackParameters.ExpectedCurrentBytes =
-                            $postState.Snapshot.Bytes
-                        $rollbackParameters.ExpectedCurrentLastWriteTimeUtc =
-                            $postState.Snapshot.LastWriteTimeUtc
-                        $rollbackParameters.RequireExistingTarget = $true
-                    }
-                    else {
-                        $rollbackParameters.RequireNewTarget = $true
-                    }
-                    if ($IsWindows) {
-                        if ([bool]$postState.Existed) {
-                            $rollbackParameters.ExpectedCurrentAcl =
-                                $postState.Snapshot.Acl
-                        }
-                        $rollbackParameters.DesiredAcl =
-                            $initialState.Snapshot.Acl
-                    }
-                    Write-ToolkitBytesAtomic @rollbackParameters
-                    if ((Get-Item `
-                            -LiteralPath $entry.Target `
-                            -ErrorAction Stop).LastWriteTimeUtc -ne
-                        [DateTime]$initialState.Snapshot.LastWriteTimeUtc) {
-                        throw "回滚后的 LastWriteTimeUtc 校验失败：$($entry.Target)"
-                    }
-                }
-                elseif ([bool]$postState.Existed) {
-                    Remove-ToolkitFileIfSnapshotMatches `
-                        -Path $entry.Target `
-                        -Snapshot $postState.Snapshot
-                }
+                catch { $restored = $false }
             }
-            catch {
-                $rollbackErrors.Add(
-                    "$($entry.Name)：$($_.Exception.Message)"
-                )
+            if (-not $restored -and
+                (Test-Path -LiteralPath $legacyQuarantine -PathType Container)) {
+                throw "旧版安装删除未完成；残留保留在 $legacyQuarantine。$failure"
             }
+            throw
         }
-        if ($rollbackErrors.Count -gt 0) {
-            throw [InvalidOperationException]::new(
-                $originalError.Exception.Message +
-                    "`r`n回滚未全部完成：" +
-                    ($rollbackErrors -join '；'),
-                $originalError.Exception
-            )
-        }
-        throw $originalError
     }
 
     if ($RemoveApiKey) {
-        Remove-UninstallerEnvironmentVariable `
-            -Name 'OPENROUTER_API_KEY' `
-            -Target ([EnvironmentVariableTarget]::User)
-        Remove-UninstallerEnvironmentVariable `
-            -Name 'OPENROUTER_API_KEY' `
-            -Target ([EnvironmentVariableTarget]::Process)
-        Remove-UninstallerEnvironmentVariable `
-            -Name 'CODEX_OPENROUTER_PROCESS_KEY_OVERRIDE' `
-            -Target ([EnvironmentVariableTarget]::Process)
-        Publish-ToolkitEnvironmentChange
+        [Environment]::SetEnvironmentVariable(
+            'OPENROUTER_API_KEY',
+            $null,
+            [EnvironmentVariableTarget]::User
+        )
+        [Environment]::SetEnvironmentVariable(
+            'OPENROUTER_API_KEY',
+            $null,
+            [EnvironmentVariableTarget]::Process
+        )
     }
 
-    [pscustomobject]@{
+    $result = [pscustomobject]@{
         Uninstalled = $true
-        RestoredOpenAIProvider = -not $KeepCurrentProvider
+        ModuleRemoved = $moduleRemoved
+        ConfigCleaned = $configChanged
+        CatalogRemoved = $catalogRemoved
+        ProfileMarkersRemoved = $profilePlans.Count
+        LegacyInstallRemoved = $legacyRemoved
         ApiKeyRemoved = [bool]$RemoveApiKey
-        RecoveryPath = $uninstallBackup
     }
 }
 finally {
-    Exit-ToolkitMutex -Mutex $mutex
+    if ($null -ne $mutex) {
+        & $module { param($Value) Exit-CxMutex $Value } $mutex
+    }
+    Remove-Module CodexOpenRouter -Force -ErrorAction SilentlyContinue
 }
+$result
