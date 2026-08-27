@@ -36,7 +36,7 @@ Status output reports only whether the key is available and never prints its val
 Get-CodexOpenRouterStatus
 ```
 
-The script accepts OpenRouter keys with the `sk-or-` prefix and rejects whitespace or control characters. After setting or rotating the default `User`-scoped value, close and reopen PowerShell. An existing window may retain an older `Process`-scoped value. To update the current window immediately, dot-source the process-scoped script:
+The script accepts OpenRouter keys with the `sk-or-` prefix and rejects whitespace or control characters. `cxor` requires a valid `User`-scoped key, and the setup script broadcasts the environment change to Windows Shell. After rotation, run `cxor` again so the desktop app restarts with the new value. If an existing window has an explicit `Process` override, clear the override or close that window. The process-scoped command below is limited to catalog refresh or temporary diagnostics:
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process
@@ -68,6 +68,8 @@ cxor -ForceRefresh -NoRestart
 ```
 
 The persistent provider's `env_key` is used for inference. Isolated `command` authentication created by the refresh flow is limited to catalog refresh, and its temporary `CODEX_HOME` is removed when the flow ends.
+
+Catalog refresh commits as an independent maintenance operation. If refresh succeeds and a later provider-configuration or model-cache switch fails, the valid new catalog remains while configuration and cache changes use CAS rollback.
 
 Upgrade removes the legacy persistent `[model_providers.openrouter.auth]` table. Inline or dotted `auth` declarations stop the merge; back up `config.toml`, remove that authentication declaration manually, and rerun installation.
 

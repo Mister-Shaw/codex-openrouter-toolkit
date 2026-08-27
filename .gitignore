@@ -9,6 +9,8 @@
 *.tmp-*
 *.rollback-*
 *.discard-*
+*.delete-*
+*.refresh-*
 models_cache*.json
 openrouter-model-catalog*.json
 settings.json

@@ -16,6 +16,14 @@ $commonHelperPath = Join-Path `
 if (-not (Test-Path -LiteralPath $commonHelperPath -PathType Leaf)) {
     throw "找不到共同安全 helper：$commonHelperPath"
 }
+$commonHelperItem = Get-Item `
+    -LiteralPath $commonHelperPath `
+    -Force `
+    -ErrorAction Stop
+if (($commonHelperItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+    $commonHelperItem.Length -gt 25MB) {
+    throw "共同安全 helper 不是受支持的普通文件或超过 26214400 字节限制：$commonHelperPath"
+}
 . $commonHelperPath
 
 function Remove-KeyEnvironmentVariable {
@@ -84,6 +92,7 @@ if ($Remove) {
                 -Name $processOverrideMarker `
                 -Target $processTarget
         }
+        Publish-ToolkitEnvironmentChange
     }
 
     Write-Host "$apiKeyName 已从 $Scope 范围移除；密钥内容未输出。"
@@ -118,6 +127,7 @@ try {
         Remove-KeyEnvironmentVariable `
             -Name $processOverrideMarker `
             -Target $processTarget
+        Publish-ToolkitEnvironmentChange
     }
     else {
         [Environment]::SetEnvironmentVariable(

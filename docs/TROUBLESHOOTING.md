@@ -36,7 +36,7 @@ pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 Get-CodexOpenRouterStatus
 ```
 
-脚本接受带 `sk-or-` 前缀的 OpenRouter Key，并拒绝空格或控制字符。使用默认 `User` 范围设置或轮换后，请关闭并重新打开 PowerShell。已有窗口可能保留旧的 `Process` 值；需要立即更新当前窗口时，可点号加载进程范围脚本：
+脚本接受带 `sk-or-` 前缀的 OpenRouter Key，并拒绝空格或控制字符。`cxor` 要求有效的 `User` 范围 Key；设置脚本会向 Windows Shell 广播变化。轮换后再次运行 `cxor`，让桌面端以新值重启。已有窗口若设置过显式 `Process` override，请清除 override 或关闭该窗口。下面的进程范围仅用于目录刷新或临时诊断：
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process
@@ -68,6 +68,8 @@ cxor -ForceRefresh -NoRestart
 ```
 
 持久化 provider 的 `env_key` 用于推理。刷新流程创建的隔离 `command` auth 只服务于目录刷新，临时 `CODEX_HOME` 会在流程结束后清理。
+
+目录刷新作为独立维护动作提交。若刷新成功、随后的供应商配置或模型缓存切换失败，有效的新目录会保留，配置与缓存会按 CAS 回滚。
 
 升级流程会清理旧版持久化 `[model_providers.openrouter.auth]` 表。若配置使用 inline 或 dotted `auth`，工具包会停止合并；先备份 `config.toml`，再手动移除该认证声明并重新安装。
 

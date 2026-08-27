@@ -21,6 +21,14 @@ $commonHelperPath = Join-Path `
 if (-not (Test-Path -LiteralPath $commonHelperPath -PathType Leaf)) {
     throw "找不到共同安全 helper：$commonHelperPath"
 }
+$commonHelperItem = Get-Item `
+    -LiteralPath $commonHelperPath `
+    -Force `
+    -ErrorAction Stop
+if (($commonHelperItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+    $commonHelperItem.Length -gt 25MB) {
+    throw "共同安全 helper 不是受支持的普通文件或超过 26214400 字节限制：$commonHelperPath"
+}
 . $commonHelperPath
 
 function Resolve-RestorePath {
@@ -90,6 +98,61 @@ function Get-RestoreProperty {
     return $property.Value
 }
 
+function ConvertFrom-RestoreUtcTimestamp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    $timestamp = if ($Value -is [DateTime]) {
+        [DateTime]$Value
+    }
+    elseif ($Value -is [DateTimeOffset]) {
+        ([DateTimeOffset]$Value).UtcDateTime
+    }
+    elseif ($Value -is [string]) {
+        [DateTime]$parsed = [DateTime]::MinValue
+        if (-not [DateTime]::TryParseExact(
+                [string]$Value,
+                'o',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind,
+                [ref]$parsed
+            )) {
+            throw "$Context 必须是 round-trip 格式的 UTC 时间。"
+        }
+        $parsed
+    }
+    else {
+        throw "$Context 必须是 UTC 时间。"
+    }
+    if ($timestamp.Kind -ne [DateTimeKind]::Utc) {
+        throw "$Context 必须明确标记为 UTC 时间。"
+    }
+    return $timestamp
+}
+
+function Assert-RestoreLastWriteTimeUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [DateTime]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $actual = (Get-Item -LiteralPath $Path -ErrorAction Stop).LastWriteTimeUtc
+    if ($actual -ne $Expected) {
+        throw "$Label 的 LastWriteTimeUtc 与预期不一致。"
+    }
+}
+
 function Assert-RestoreNoReparsePoint {
     param(
         [Parameter(Mandatory = $true)]
@@ -98,7 +161,10 @@ function Assert-RestoreNoReparsePoint {
         [Parameter(Mandatory = $true)]
         [string]$Label,
 
-        [switch]$Recurse
+        [switch]$Recurse,
+
+        [ValidateRange(1, 100000)]
+        [int]$MaximumEntries = 4096
     )
 
     $resolvedPath = [IO.Path]::GetFullPath($Path)
@@ -126,6 +192,7 @@ function Assert-RestoreNoReparsePoint {
     $rootItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
     $pending = [Collections.Generic.Stack[IO.FileSystemInfo]]::new()
     $pending.Push($rootItem)
+    $visitedEntries = 1
 
     while ($pending.Count -gt 0) {
         $item = $pending.Pop()
@@ -134,7 +201,17 @@ function Assert-RestoreNoReparsePoint {
         }
 
         if ($Recurse -and $item.PSIsContainer) {
-            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)) {
+            foreach ($childPath in [IO.Directory]::EnumerateFileSystemEntries(
+                    $item.FullName
+                )) {
+                $child = Get-Item `
+                    -LiteralPath $childPath `
+                    -Force `
+                    -ErrorAction Stop
+                $visitedEntries++
+                if ($visitedEntries -gt $MaximumEntries) {
+                    throw "$Label 的项目数量超过 $MaximumEntries 项限制：$resolvedPath"
+                }
                 if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     throw "$Label 含有不允许的重解析点：$($child.FullName)"
                 }
@@ -155,6 +232,35 @@ function Get-RestoreSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
 }
 
+function ConvertFrom-RestoreUtf8Bytes {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [byte[]]$Bytes,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $offset = if ($Bytes.Length -ge 3 -and
+        $Bytes[0] -eq 0xEF -and
+        $Bytes[1] -eq 0xBB -and
+        $Bytes[2] -eq 0xBF) {
+        3
+    }
+    else { 0 }
+    try {
+        return [Text.UTF8Encoding]::new($false, $true).GetString(
+            $Bytes,
+            $offset,
+            $Bytes.Length - $offset
+        )
+    }
+    catch {
+        throw "$Label 不是有效的 UTF-8 文本：$($_.Exception.Message)"
+    }
+}
+
 function Assert-RestoreProfileSyntax {
     param(
         [Parameter(Mandatory = $true)]
@@ -166,7 +272,12 @@ function Assert-RestoreProfileSyntax {
 
     $tokens = $null
     $parseErrors = $null
-    $content = [IO.File]::ReadAllText($Path)
+    $profileSnapshot = Get-ToolkitFileSnapshot `
+        -Path $Path `
+        -MaximumBytes 5MB
+    $content = ConvertFrom-RestoreUtf8Bytes `
+        -Bytes $profileSnapshot.Bytes `
+        -Label $Label
     [void][Management.Automation.Language.Parser]::ParseInput(
         $content,
         [ref]$tokens,
@@ -181,21 +292,46 @@ function Assert-RestoreProfileSyntax {
 function Get-RestoreDirectoryInventory {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+
+        [ValidateRange(1, 104857600)]
+        [long]$MaximumFileBytes = 25MB,
+
+        [ValidateRange(1, 100000)]
+        [int]$MaximumEntries = 1024,
+
+        [ValidateRange(1, 104857600)]
+        [long]$MaximumTotalBytes = 64MB
     )
 
     $basePath = Resolve-RestorePath -Path $Path -Label '目录'
+    [void](Get-ToolkitSafeDirectoryTreePaths `
+        -Root $basePath `
+        -MaximumEntries $MaximumEntries)
     $basePrefix = $basePath + [IO.Path]::DirectorySeparatorChar
     $inventory = [Collections.Generic.List[string]]::new()
-    $files = @(Get-ChildItem -LiteralPath $basePath -File -Recurse -Force -ErrorAction Stop |
-            Sort-Object -Property FullName)
-    foreach ($file in $files) {
-        $relativePath = $file.FullName.Substring($basePrefix.Length)
+    $totalBytes = 0L
+    foreach ($filePath in [IO.Directory]::EnumerateFiles(
+            $basePath,
+            '*',
+            [IO.SearchOption]::AllDirectories
+        )) {
+        if ($inventory.Count -ge $MaximumEntries) {
+            throw "目录文件数量超过 $MaximumEntries 项限制：$basePath"
+        }
+        $relativePath = $filePath.Substring($basePrefix.Length)
+        $snapshot = Get-ToolkitFileSnapshot `
+            -Path $filePath `
+            -MaximumBytes $MaximumFileBytes
+        $totalBytes += [long]$snapshot.Length
+        if ($totalBytes -gt $MaximumTotalBytes) {
+            throw "目录文件总大小超过 $MaximumTotalBytes 字节限制：$basePath"
+        }
         $inventory.Add(
-            "$relativePath`t$([long]$file.Length)`t$(Get-RestoreSha256 -Path $file.FullName)"
+            "$relativePath`t$([long]$snapshot.Length)`t$($snapshot.Sha256.ToUpperInvariant())"
         )
     }
-    return @($inventory)
+    return @($inventory | Sort-Object)
 }
 
 function ConvertFrom-RestoreManifestInventory {
@@ -208,12 +344,16 @@ function ConvertFrom-RestoreManifestInventory {
         [string]$BasePath
     )
 
+    if ($Entries.Count -gt 1024) {
+        throw 'PreviousInstallFiles 的项目数量超过 1024 项限制。'
+    }
     $resolvedBase = Resolve-RestorePath -Path $BasePath -Label 'previous-install'
     $basePrefix = $resolvedBase + [IO.Path]::DirectorySeparatorChar
     $seenPaths = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::OrdinalIgnoreCase
     )
     $inventory = [Collections.Generic.List[string]]::new()
+    $totalDeclaredBytes = 0L
     foreach ($entry in $Entries) {
         if ($null -eq $entry) {
             throw 'PreviousInstallFiles 包含空条目。'
@@ -248,11 +388,16 @@ function ConvertFrom-RestoreManifestInventory {
             throw "PreviousInstallFiles 的相对路径重复：$relativePath"
         }
         if (($lengthValue -isnot [long] -and $lengthValue -isnot [int]) -or
-            [long]$lengthValue -lt 0) {
+            [long]$lengthValue -lt 0 -or
+            [long]$lengthValue -gt 25MB) {
             throw "PreviousInstallFiles 的长度无效：$relativePath"
         }
         if ($sha256 -cnotmatch '^[A-F0-9]{64}$') {
             throw "PreviousInstallFiles 的 SHA256 无效：$relativePath"
+        }
+        $totalDeclaredBytes += [long]$lengthValue
+        if ($totalDeclaredBytes -gt 64MB) {
+            throw 'PreviousInstallFiles 的声明总大小超过 67108864 字节限制。'
         }
         $inventory.Add("$relativePath`t$([long]$lengthValue)`t$sha256")
     }
@@ -280,7 +425,11 @@ function Assert-RestoreToolkitInstallOwnership {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "$Label 必须是目录：$Path"
     }
-    Assert-RestoreNoReparsePoint -Path $Path -Label $Label -Recurse
+    Assert-RestoreNoReparsePoint `
+        -Path $Path `
+        -Label $Label `
+        -Recurse `
+        -MaximumEntries 1024
     $settingsPath = Join-Path $Path 'settings.json'
     $moduleManifestPath = Join-Path `
         $Path `
@@ -291,9 +440,27 @@ function Assert-RestoreToolkitInstallOwnership {
             throw "$Label 缺少工具包文件：$requiredPath"
         }
         Assert-RestoreNoReparsePoint -Path $requiredPath -Label "$Label 的工具包文件"
+        $maximumRequiredBytes = if (Test-RestorePathEqual `
+                -Left $requiredPath `
+                -Right $settingsPath) {
+            5MB
+        }
+        else { 25MB }
+        if ((Get-Item `
+                -LiteralPath $requiredPath `
+                -Force `
+                -ErrorAction Stop).Length -gt $maximumRequiredBytes) {
+            throw "$Label 的工具包文件超过 $maximumRequiredBytes 字节限制：$requiredPath"
+        }
     }
     try {
-        $settings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -ErrorAction Stop
+        $settingsSnapshot = Get-ToolkitFileSnapshot `
+            -Path $settingsPath `
+            -MaximumBytes 5MB
+        $settingsText = ConvertFrom-RestoreUtf8Bytes `
+            -Bytes $settingsSnapshot.Bytes `
+            -Label "$Label 的 settings.json"
+        $settings = $settingsText | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
         throw "$Label 的 settings.json 无法解析：$($_.Exception.Message)"
@@ -344,9 +511,10 @@ function Assert-RestoreToolkitInstallOwnership {
         }
     }
     try {
-        $moduleManifest = Import-PowerShellDataFile `
-            -LiteralPath $moduleManifestPath `
-            -ErrorAction Stop
+        $moduleManifestRead = Import-ToolkitPowerShellDataFileLocked `
+            -Path $moduleManifestPath `
+            -MaximumBytes 5MB
+        $moduleManifest = $moduleManifestRead.Data
     }
     catch {
         throw "$Label 的模块清单无法解析：$($_.Exception.Message)"
@@ -355,6 +523,7 @@ function Assert-RestoreToolkitInstallOwnership {
         [string]$moduleManifest.GUID -cne 'be74dba0-28ed-4ba3-adff-f0fc0d107b39') {
         throw "$Label 的模块清单身份无效。"
     }
+    return $moduleManifestRead.Snapshot
 }
 
 function Assert-RestoreInventoryEqual {
@@ -387,7 +556,20 @@ function Copy-RestoreFileAtomic {
         [string]$Source,
 
         [Parameter(Mandatory = $true)]
-        [string]$Destination
+        [string]$Destination,
+
+        [AllowNull()]
+        [string]$AclSddl,
+
+        [Nullable[DateTime]]$LastWriteTimeUtc,
+
+        [AllowNull()]
+        [object]$ExpectedCurrentSnapshot,
+
+        [ValidateRange(1, 104857600)]
+        [long]$MaximumBytes = 50MB,
+
+        [switch]$PassThru
     )
 
     if (Test-Path -LiteralPath $Destination -PathType Container) {
@@ -398,16 +580,47 @@ function Copy-RestoreFileAtomic {
     }
     Assert-RestoreNoReparsePoint -Path $Source -Label '源文件路径'
     Assert-RestoreNoReparsePoint -Path $Destination -Label '目标文件路径'
-    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        Write-ToolkitBytesAtomic `
-            -Path $Destination `
-            -Bytes ([IO.File]::ReadAllBytes($Source))
+    $sourceSnapshot = Get-ToolkitFileSnapshot `
+        -Path $Source `
+        -MaximumBytes $MaximumBytes
+    $restoreLastWriteTimeUtc = if ($null -ne $LastWriteTimeUtc) {
+        [DateTime]$LastWriteTimeUtc
     }
     else {
-        Copy-ToolkitFileAtomic `
-            -Source $Source `
-            -Destination $Destination
+        $sourceSnapshot.LastWriteTimeUtc
     }
+    $writeParameters = @{
+        Path = $Destination
+        Bytes = $sourceSnapshot.Bytes
+        TargetLastWriteTimeUtc = $restoreLastWriteTimeUtc
+        MaximumBytes = $MaximumBytes
+    }
+    if ($IsWindows -and -not [string]::IsNullOrWhiteSpace($AclSddl)) {
+        $writeParameters.DesiredAcl = New-ToolkitFileAclFromSddl -Sddl $AclSddl
+    }
+    if ($null -ne $ExpectedCurrentSnapshot) {
+        if (-not (Test-ToolkitFileMatchesSnapshot `
+                -Path $Destination `
+                -Snapshot $ExpectedCurrentSnapshot)) {
+            throw "恢复写入 CAS 冲突，保留外部修改：$Destination"
+        }
+        $writeParameters.ExpectedCurrentBytes = $ExpectedCurrentSnapshot.Bytes
+        $writeParameters.ExpectedCurrentLastWriteTimeUtc =
+            $ExpectedCurrentSnapshot.LastWriteTimeUtc
+        if ($IsWindows) {
+            $writeParameters.ExpectedCurrentAcl = $ExpectedCurrentSnapshot.Acl
+        }
+        $writeParameters.RequireExistingTarget = $true
+    }
+    elseif (Test-Path -LiteralPath $Destination) {
+        throw "恢复写入 CAS 冲突，目标被并发创建：$Destination"
+    }
+    else {
+        $writeParameters.RequireNewTarget = $true
+    }
+    if ($PassThru) { $writeParameters.PassThru = $true }
+    $productSnapshot = Write-ToolkitBytesAtomic @writeParameters
+    if ($PassThru) { return $productSnapshot }
 }
 
 function Copy-RestoreDirectoryContents {
@@ -425,85 +638,85 @@ function Copy-RestoreDirectoryContents {
     if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
         throw "目录复制目标必须是目录：$Destination"
     }
-    Assert-RestoreNoReparsePoint -Path $Source -Label '目录复制源' -Recurse
-    Assert-RestoreNoReparsePoint -Path $Destination -Label '目录复制目标' -Recurse
-    if (@(Get-ChildItem `
-            -LiteralPath $Destination `
-            -Force `
-            -ErrorAction Stop).Count -ne 0) {
-        throw "目录复制目标必须为空：$Destination"
-    }
-
     $resolvedSource = [IO.Path]::GetFullPath($Source)
     $resolvedDestination = [IO.Path]::GetFullPath($Destination)
+    Assert-RestoreNoReparsePoint `
+        -Path $resolvedSource `
+        -Label '目录复制源' `
+        -Recurse `
+        -MaximumEntries 1024
+    Assert-RestoreNoReparsePoint `
+        -Path $resolvedDestination `
+        -Label '目录复制目标' `
+        -Recurse `
+        -MaximumEntries 1024
+    $destinationEnumerator = [IO.Directory]::EnumerateFileSystemEntries(
+        $resolvedDestination
+    ).GetEnumerator()
+    try {
+        if ($destinationEnumerator.MoveNext()) {
+            throw "目录复制目标必须为空：$resolvedDestination"
+        }
+    }
+    finally {
+        $destinationEnumerator.Dispose()
+    }
+    Set-ToolkitPrivateDirectoryTree -Root $resolvedDestination
+
+    $sourcePaths = @(Get-ToolkitSafeDirectoryTreePaths `
+            -Root $resolvedSource `
+            -MaximumEntries 1024 |
+            Sort-Object `
+                @{ Expression = { $_.Length } }, `
+                @{ Expression = { $_ } })
     $sourcePrefix = $resolvedSource.TrimEnd('\', '/') +
         [IO.Path]::DirectorySeparatorChar
-    $directoryPairs = [Collections.Generic.List[object]]::new()
-    $filePairs = [Collections.Generic.List[object]]::new()
-    $directoryPairs.Add([pscustomobject]@{
-        Source = $resolvedSource
-        Destination = $resolvedDestination
-    })
-
-    foreach ($sourceDirectory in @(Get-ChildItem `
-            -LiteralPath $resolvedSource `
-            -Directory `
-            -Recurse `
+    $totalSourceBytes = 0L
+    foreach ($sourcePath in $sourcePaths) {
+        if (Test-ToolkitPathEqual `
+                -Left $sourcePath `
+                -Right $resolvedSource) {
+            continue
+        }
+        $sourceItem = Get-Item `
+            -LiteralPath $sourcePath `
             -Force `
-            -ErrorAction Stop | Sort-Object FullName)) {
-        $relativePath = $sourceDirectory.FullName.Substring($sourcePrefix.Length)
-        $targetDirectory = Join-Path $resolvedDestination $relativePath
-        [void](New-Item `
-            -ItemType Directory `
-            -Path $targetDirectory `
-            -ErrorAction Stop)
-        $directoryPairs.Add([pscustomobject]@{
-            Source = $sourceDirectory.FullName
-            Destination = $targetDirectory
-        })
-    }
+            -ErrorAction Stop
+        if (($sourceItem.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "目录复制源含有不允许的重解析点：$sourcePath"
+        }
+        $relativePath = $sourcePath.Substring($sourcePrefix.Length)
+        if ($sourceItem.PSIsContainer) {
+            $targetDirectory = Join-Path $resolvedDestination $relativePath
+            if (Test-Path -LiteralPath $targetDirectory) {
+                throw "目录复制目标被并发占用：$targetDirectory"
+            }
+            [void](New-Item `
+                -ItemType Directory `
+                -Path $targetDirectory `
+                -ErrorAction Stop)
+            Set-ToolkitPrivateFileSystemAcl -Path $targetDirectory
+            continue
+        }
 
-    foreach ($sourceFile in @(Get-ChildItem `
-            -LiteralPath $resolvedSource `
-            -File `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop | Sort-Object FullName)) {
-        $relativePath = $sourceFile.FullName.Substring($sourcePrefix.Length)
         $targetFile = Join-Path $resolvedDestination $relativePath
-        Copy-ToolkitFileAtomic `
-            -Source $sourceFile.FullName `
-            -Destination $targetFile
-        $filePairs.Add([pscustomobject]@{
-            Source = $sourceFile.FullName
-            Destination = $targetFile
-        })
+        $sourceSnapshot = Get-ToolkitFileSnapshot `
+            -Path $sourcePath `
+            -MaximumBytes 25MB
+        $totalSourceBytes += [long]$sourceSnapshot.Length
+        if ($totalSourceBytes -gt 64MB) {
+            throw '目录复制源文件总大小超过 67108864 字节限制。'
+        }
+        Write-ToolkitBytesAtomic `
+            -Path $targetFile `
+            -Bytes $sourceSnapshot.Bytes `
+            -TargetLastWriteTimeUtc $sourceSnapshot.LastWriteTimeUtc `
+            -MaximumBytes 25MB `
+            -RequireNewTarget
     }
 
-    if ($IsWindows) {
-        foreach ($pair in @($directoryPairs | Sort-Object {
-                    $_.Destination.Length
-                } -Descending)) {
-            $sourceAcl = Get-Acl -LiteralPath $pair.Source -ErrorAction Stop
-            Set-Acl `
-                -LiteralPath $pair.Destination `
-                -AclObject $sourceAcl `
-                -ErrorAction Stop
-            $targetAcl = Get-Acl `
-                -LiteralPath $pair.Destination `
-                -ErrorAction Stop
-            if ($targetAcl.Sddl -cne $sourceAcl.Sddl) {
-                throw "目录 ACL 复读校验失败：$($pair.Destination)"
-            }
-        }
-        foreach ($pair in $filePairs) {
-            $sourceAcl = Get-Acl -LiteralPath $pair.Source -ErrorAction Stop
-            $targetAcl = Get-Acl -LiteralPath $pair.Destination -ErrorAction Stop
-            if ($targetAcl.Sddl -cne $sourceAcl.Sddl) {
-                throw "目录复制后的文件 ACL 校验失败：$($pair.Destination)"
-            }
-        }
-    }
+    Set-ToolkitPrivateDirectoryTree -Root $resolvedDestination
 }
 
 if (-not $Force) {
@@ -520,6 +733,13 @@ else {
     Resolve-RestorePath `
         -Path (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex') `
         -Label 'CodexHome'
+}
+
+$volumeRoot = [IO.Path]::GetPathRoot($resolvedCodexHome).
+    TrimEnd([IO.Path]::DirectorySeparatorChar)
+if ($resolvedCodexHome.TrimEnd([IO.Path]::DirectorySeparatorChar) -ceq
+    $volumeRoot) {
+    throw 'CodexHome 不能是卷根目录。'
 }
 
 $resolvedProfilePath = if (-not [string]::IsNullOrWhiteSpace($ProfilePath)) {
@@ -557,7 +777,13 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 Assert-RestoreNoReparsePoint -Path $manifestPath -Label '备份清单'
 
 try {
-    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop
+    $manifestSnapshot = Get-ToolkitFileSnapshot `
+        -Path $manifestPath `
+        -MaximumBytes 5MB
+    $manifestText = ConvertFrom-RestoreUtf8Bytes `
+        -Bytes $manifestSnapshot.Bytes `
+        -Label '备份清单'
+    $manifest = $manifestText | ConvertFrom-Json -ErrorAction Stop
 }
 catch {
     throw "无法读取备份清单：$($_.Exception.Message)"
@@ -576,7 +802,7 @@ if ($toolkitName -cne 'codex-openrouter-toolkit' -or
     throw '备份清单不属于受支持的 Codex OpenRouter Toolkit。'
 }
 $schemaVersion = [int]$schemaValue
-if ($schemaVersion -notin @(1, 2)) {
+if ($schemaVersion -notin @(1, 2, 3)) {
     throw "不支持备份清单 schema：$schemaVersion"
 }
 
@@ -592,71 +818,75 @@ if (Test-Path -LiteralPath $previousInstallPath) {
     Assert-RestoreNoReparsePoint `
         -Path $previousInstallPath `
         -Label 'previous-install' `
-        -Recurse
+        -Recurse `
+        -MaximumEntries 1024
 }
 
 $installExisted = $previousInstallExists
 $manifestPreviousInstallInventory = @()
-if ($schemaVersion -eq 2) {
+if ($schemaVersion -ge 2) {
+    $schemaContext = "schema $schemaVersion 备份清单"
     $manifestCodexHome = [string](Get-RestoreProperty `
             -InputObject $manifest `
             -Name 'CodexHome' `
-            -Context 'schema 2 备份清单')
+            -Context $schemaContext)
     $manifestProfilePath = [string](Get-RestoreProperty `
             -InputObject $manifest `
             -Name 'ProfilePath' `
-            -Context 'schema 2 备份清单')
+            -Context $schemaContext)
     $manifestInstallRoot = [string](Get-RestoreProperty `
             -InputObject $manifest `
             -Name 'InstallRoot' `
-            -Context 'schema 2 备份清单')
+            -Context $schemaContext)
     $manifestInstallExisted = Get-RestoreProperty `
         -InputObject $manifest `
         -Name 'InstallExisted' `
-        -Context 'schema 2 备份清单'
+        -Context $schemaContext
 
     if (-not (Test-RestorePathEqual -Left $manifestCodexHome -Right $resolvedCodexHome)) {
-        throw 'schema 2 清单中的 CodexHome 与恢复参数不一致。'
+        throw "schema $schemaVersion 清单中的 CodexHome 与恢复参数不一致。"
     }
     if (-not (Test-RestorePathEqual -Left $manifestProfilePath -Right $resolvedProfilePath)) {
-        throw 'schema 2 清单中的 ProfilePath 与恢复参数不一致。'
+        throw "schema $schemaVersion 清单中的 ProfilePath 与恢复参数不一致。"
     }
     if (-not (Test-RestorePathEqual -Left $manifestInstallRoot -Right $installRoot)) {
-        throw 'schema 2 清单中的 InstallRoot 与推导路径不一致。'
+        throw "schema $schemaVersion 清单中的 InstallRoot 与推导路径不一致。"
     }
     if ($manifestInstallExisted -isnot [bool]) {
-        throw 'schema 2 清单中的 InstallExisted 必须是布尔值。'
+        throw "schema $schemaVersion 清单中的 InstallExisted 必须是布尔值。"
     }
     $installExisted = [bool]$manifestInstallExisted
     if ($installExisted -ne $previousInstallExists) {
-        throw 'schema 2 清单中的 InstallExisted 与 previous-install 状态不一致。'
+        throw "schema $schemaVersion 清单中的 InstallExisted 与 previous-install 状态不一致。"
     }
     $previousInstallFilesValue = Get-RestoreProperty `
         -InputObject $manifest `
         -Name 'PreviousInstallFiles' `
-        -Context 'schema 2 备份清单'
+        -Context $schemaContext
     $manifestPreviousInstallInventory = @(
         ConvertFrom-RestoreManifestInventory `
             -Entries @($previousInstallFilesValue) `
             -BasePath $previousInstallPath
     )
     if ($installExisted -and $manifestPreviousInstallInventory.Count -eq 0) {
-        throw 'schema 2 清单中的 PreviousInstallFiles 不能为空。'
+        throw "schema $schemaVersion 清单中的 PreviousInstallFiles 不能为空。"
     }
     if (-not $installExisted -and $manifestPreviousInstallInventory.Count -ne 0) {
-        throw 'schema 2 首次安装清单的 PreviousInstallFiles 必须为空。'
+        throw "schema $schemaVersion 首次安装清单的 PreviousInstallFiles 必须为空。"
     }
 }
 
 if ($installExisted) {
-    Assert-RestoreToolkitInstallOwnership `
+    $null = Assert-RestoreToolkitInstallOwnership `
         -Path $previousInstallPath `
         -ExpectedCodexHome $resolvedCodexHome `
         -ExpectedInstallRoot $installRoot `
         -ExpectedProfilePath $resolvedProfilePath `
         -Label 'previous-install'
-    $previousInstallInventory = @(Get-RestoreDirectoryInventory -Path $previousInstallPath)
-    if ($schemaVersion -eq 2) {
+    $previousInstallInventory = @(Get-RestoreDirectoryInventory `
+        -Path $previousInstallPath `
+        -MaximumFileBytes 25MB)
+    if ($schemaVersion -ge 2) {
         Assert-RestoreInventoryEqual `
             -Expected $manifestPreviousInstallInventory `
             -Actual $previousInstallInventory `
@@ -671,22 +901,27 @@ $expectedFiles = [ordered]@{
     'profile' = [pscustomobject]@{
         Target = $resolvedProfilePath
         BackupRelativePath = 'profile.bak'
+        MaximumBytes = 5MB
     }
     'config' = [pscustomobject]@{
         Target = Join-Path $resolvedCodexHome 'config.toml'
         BackupRelativePath = 'config.bak'
+        MaximumBytes = 5MB
     }
     'catalog' = [pscustomobject]@{
         Target = Join-Path $resolvedCodexHome 'openrouter-model-catalog.json'
         BackupRelativePath = 'catalog.bak'
+        MaximumBytes = 50MB
     }
     'active-cache' = [pscustomobject]@{
         Target = Join-Path $resolvedCodexHome 'models_cache.json'
         BackupRelativePath = 'active-cache.bak'
+        MaximumBytes = 50MB
     }
     'openai-cache' = [pscustomobject]@{
         Target = Join-Path $resolvedCodexHome 'models_cache.openai.json'
         BackupRelativePath = 'openai-cache.bak'
+        MaximumBytes = 50MB
     }
 }
 
@@ -741,6 +976,8 @@ foreach ($entry in $manifestFiles) {
         -Path (Join-Path $resolvedBackupPath $expected.BackupRelativePath) `
         -Label "文件项 $name 的备份文件"
     $expectedHash = $null
+    $sourceAclSddl = $null
+    $sourceLastWriteTimeUtc = $null
     if ($schemaVersion -eq 1) {
         $backupFileValue = Get-RestoreProperty `
             -InputObject $entry `
@@ -765,32 +1002,80 @@ foreach ($entry in $manifestFiles) {
         }
     }
     else {
+        $fileSchemaContext = "schema $schemaVersion 文件项 $name"
         $relativeBackupPath = [string](Get-RestoreProperty `
                 -InputObject $entry `
                 -Name 'BackupRelativePath' `
-                -Context "schema 2 文件项 $name")
+                -Context $fileSchemaContext)
         if ($relativeBackupPath -cne [string]$expected.BackupRelativePath -or
             [IO.Path]::IsPathRooted($relativeBackupPath)) {
-            throw "schema 2 文件项 $name 的 BackupRelativePath 无效。"
+            throw "schema $schemaVersion 文件项 $name 的 BackupRelativePath 无效。"
         }
 
         $shaValue = Get-RestoreProperty `
             -InputObject $entry `
             -Name 'Sha256' `
-            -Context "schema 2 文件项 $name"
+            -Context $fileSchemaContext
         if ([bool]$existed) {
             $expectedHash = [string]$shaValue
             if ($expectedHash -cnotmatch '^[A-F0-9]{64}$') {
-                throw "schema 2 文件项 $name 的 Sha256 无效。"
+                throw "schema $schemaVersion 文件项 $name 的 Sha256 无效。"
             }
         }
         elseif ($null -ne $shaValue) {
-            throw "schema 2 文件项 $name 在 Existed=false 时 Sha256 必须为 null。"
+            throw "schema $schemaVersion 文件项 $name 在 Existed=false 时 Sha256 必须为 null。"
+        }
+
+        $aclProperty = $entry.PSObject.Properties['AclSddl']
+        if ($IsWindows -and [bool]$existed -and
+            ($null -eq $aclProperty -or
+                $null -eq $aclProperty.Value -or
+                $aclProperty.Value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$aclProperty.Value))) {
+            throw "Windows schema $schemaVersion 文件项 $name 在 Existed=true 时必须包含非空 AclSddl。"
+        }
+        if ($null -ne $aclProperty -and $null -ne $aclProperty.Value) {
+            if (-not [bool]$existed) {
+                throw "schema $schemaVersion 文件项 $name 在 Existed=false 时 AclSddl 必须为 null。"
+            }
+            if ($aclProperty.Value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$aclProperty.Value) -or
+                ([string]$aclProperty.Value).Length -gt 32768) {
+                throw "schema $schemaVersion 文件项 $name 的 AclSddl 无效。"
+            }
+            $sourceAclSddl = [string]$aclProperty.Value
+            if ($IsWindows) {
+                try {
+                    $parsedAcl = New-ToolkitFileAclFromSddl `
+                        -Sddl $sourceAclSddl
+                }
+                catch {
+                    throw "schema $schemaVersion 文件项 $name 的 AclSddl 无法安全解析。"
+                }
+            }
+        }
+        if ($schemaVersion -eq 3) {
+            $timestampValue = Get-RestoreProperty `
+                -InputObject $entry `
+                -Name 'LastWriteTimeUtc' `
+                -Context $fileSchemaContext
+            if ([bool]$existed) {
+                if ($null -eq $timestampValue) {
+                    throw "schema 3 文件项 $name 缺少 LastWriteTimeUtc。"
+                }
+                $sourceLastWriteTimeUtc = ConvertFrom-RestoreUtcTimestamp `
+                    -Value $timestampValue `
+                    -Context "schema 3 文件项 $name 的 LastWriteTimeUtc"
+            }
+            elseif ($null -ne $timestampValue) {
+                throw "schema 3 文件项 $name 在 Existed=false 时 LastWriteTimeUtc 必须为 null。"
+            }
         }
     }
 
     $sourceHash = $null
     $sourceBackupPath = $null
+    $sourceSnapshot = $null
     if ([bool]$existed) {
         if (-not (Test-Path -LiteralPath $expectedBackupPath -PathType Leaf)) {
             throw "备份文件缺失：$expectedBackupPath"
@@ -798,9 +1083,17 @@ foreach ($entry in $manifestFiles) {
         Assert-RestoreNoReparsePoint `
             -Path $expectedBackupPath `
             -Label "文件项 $name 的备份文件"
-        $sourceHash = Get-RestoreSha256 -Path $expectedBackupPath
-        if ($schemaVersion -eq 2 -and $sourceHash -cne $expectedHash) {
-            throw "schema 2 文件项 $name 的 SHA256 校验失败。"
+        $sourceSnapshot = Get-ToolkitFileSnapshot `
+            -Path $expectedBackupPath `
+            -MaximumBytes ([long]$expected.MaximumBytes)
+        $sourceHash = $sourceSnapshot.Sha256.ToUpperInvariant()
+        if ($schemaVersion -ge 2 -and $sourceHash -cne $expectedHash) {
+            throw "schema $schemaVersion 文件项 $name 的 SHA256 校验失败。"
+        }
+        if ($schemaVersion -eq 3) {
+            if ($sourceSnapshot.LastWriteTimeUtc -ne $sourceLastWriteTimeUtc) {
+                throw "schema 3 文件项 $name 的备份文件 LastWriteTimeUtc 与清单不一致。"
+            }
         }
         $sourceBackupPath = $expectedBackupPath
     }
@@ -821,8 +1114,17 @@ foreach ($entry in $manifestFiles) {
         Existed = [bool]$existed
         SourceBackupPath = $sourceBackupPath
         SourceSha256 = $sourceHash
+        MaximumBytes = [long]$expected.MaximumBytes
+        SourceAclSddl = $sourceAclSddl
+        SourceLastWriteTimeUtc = $sourceLastWriteTimeUtc
         StagedPath = $null
         CurrentExisted = $false
+        CurrentAclSddl = $null
+        CurrentLastWriteTimeUtc = $null
+        CurrentSnapshot = $null
+        TransactionModified = $false
+        TransactionProductExisted = $false
+        TransactionProductSnapshot = $null
         SnapshotPath = $null
     }
 }
@@ -877,6 +1179,12 @@ $commitStarted = $false
 $currentInstallExists = $false
 $currentInstallMoved = $false
 $restoredInstallCreated = $false
+$currentInstallProduct = $null
+$currentInstallSnapshotProduct = $null
+$restoredInstallProduct = $null
+$stagedInstallProduct = $null
+$currentInstallMoveState = [ordered]@{ Disposition = 'NoMove' }
+$restoredInstallMoveState = [ordered]@{ Disposition = 'NoMove' }
 $restoreSucceeded = $false
 $rollbackCompleted = $false
 
@@ -886,18 +1194,32 @@ try {
         if (-not $currentInstallExists) {
             throw "当前安装路径必须是目录：$installRoot"
         }
-        Assert-RestoreToolkitInstallOwnership `
+        $currentInstallManifestSnapshot = Assert-RestoreToolkitInstallOwnership `
             -Path $installRoot `
             -ExpectedCodexHome $resolvedCodexHome `
             -ExpectedInstallRoot $installRoot `
             -ExpectedProfilePath $resolvedProfilePath `
             -Label '当前安装目录'
+        Set-ToolkitPrivateDirectoryTree -Root $installRoot
+        $currentInstallProduct = Get-ToolkitDirectoryStateSnapshot `
+            -Root $installRoot `
+            -MaximumFileBytes 25MB `
+            -MaximumEntries 1024 `
+            -MaximumTotalBytes 64MB
+        Assert-ToolkitDirectorySnapshotContainsFileSnapshot `
+            -DirectorySnapshot $currentInstallProduct `
+            -RelativePath 'CodexOpenRouter\CodexOpenRouter.psd1' `
+            -FileSnapshot $currentInstallManifestSnapshot `
+            -Label '当前安装模块清单'
     }
     if (Test-Path -LiteralPath $transactionRoot) {
         throw "事务目录已存在：$transactionRoot"
     }
-    [void](New-Item -ItemType Directory -Path $snapshotFilesRoot -Force -ErrorAction Stop)
-    [void](New-Item -ItemType Directory -Path $stagedFilesRoot -Force -ErrorAction Stop)
+    [void](New-Item -ItemType Directory -Path $transactionRoot -ErrorAction Stop)
+    Set-ToolkitPrivateDirectoryTree -Root $transactionRoot
+    [void](New-Item -ItemType Directory -Path $snapshotFilesRoot -ErrorAction Stop)
+    [void](New-Item -ItemType Directory -Path $stagedFilesRoot -ErrorAction Stop)
+    Set-ToolkitPrivateDirectoryTree -Root $transactionRoot
     $transactionCreated = $true
 
     foreach ($name in $expectedFiles.Keys) {
@@ -909,10 +1231,21 @@ try {
             $stagedPath = Join-Path $stagedFilesRoot "$name.staged"
             Copy-ToolkitFileAtomic `
                 -Source $validated.SourceBackupPath `
-                -Destination $stagedPath
+                -Destination $stagedPath `
+                -MaximumBytes ([long]$validated.MaximumBytes)
             Assert-RestoreNoReparsePoint -Path $stagedPath -Label "暂存文件 $name"
-            if ((Get-RestoreSha256 -Path $stagedPath) -cne $validated.SourceSha256) {
+            $stagedSnapshot = Get-ToolkitFileSnapshot `
+                -Path $stagedPath `
+                -MaximumBytes ([long]$validated.MaximumBytes)
+            if ($stagedSnapshot.Sha256.ToUpperInvariant() -cne
+                $validated.SourceSha256) {
                 throw "暂存文件 $name 的 SHA256 与预检结果不一致。"
+            }
+            if ($null -ne $validated.SourceLastWriteTimeUtc) {
+                if ($stagedSnapshot.LastWriteTimeUtc -ne
+                    [DateTime]$validated.SourceLastWriteTimeUtc) {
+                    throw "暂存文件 $name 的 LastWriteTimeUtc 与预检结果不一致。"
+                }
             }
             $validated.StagedPath = $stagedPath
         }
@@ -920,20 +1253,30 @@ try {
         if (Test-Path -LiteralPath $validated.Target -PathType Leaf) {
             Assert-RestoreNoReparsePoint -Path $validated.Target -Label "受管目标 $name"
             $snapshotPath = Join-Path $snapshotFilesRoot "$name.current"
-            $currentHash = Get-RestoreSha256 -Path $validated.Target
-            Copy-ToolkitFileAtomic `
-                -Source $validated.Target `
-                -Destination $snapshotPath
-            if ((Get-RestoreSha256 -Path $snapshotPath) -cne $currentHash) {
+            $currentSnapshot = Get-ToolkitFileSnapshot `
+                -Path $validated.Target `
+                -MaximumBytes ([long]$validated.MaximumBytes)
+            Write-ToolkitBytesAtomic `
+                -Path $snapshotPath `
+                -Bytes $currentSnapshot.Bytes `
+                -TargetLastWriteTimeUtc $currentSnapshot.LastWriteTimeUtc `
+                -MaximumBytes ([long]$validated.MaximumBytes) `
+                -RequireNewTarget
+            if ((Get-RestoreSha256 -Path $snapshotPath) -cne
+                $currentSnapshot.Sha256.ToUpperInvariant()) {
                 throw "当前文件 $name 的事务快照校验失败。"
             }
             $validated.CurrentExisted = $true
+            $validated.CurrentAclSddl = $currentSnapshot.AclSddl
+            $validated.CurrentLastWriteTimeUtc =
+                $currentSnapshot.LastWriteTimeUtc
+            $validated.CurrentSnapshot = $currentSnapshot
             $validated.SnapshotPath = $snapshotPath
         }
     }
 
     if ($installExisted) {
-        Assert-RestoreToolkitInstallOwnership `
+        $stagedSourceManifestSnapshot = Assert-RestoreToolkitInstallOwnership `
             -Path $previousInstallPath `
             -ExpectedCodexHome $resolvedCodexHome `
             -ExpectedInstallRoot $installRoot `
@@ -942,23 +1285,44 @@ try {
         Assert-RestoreNoReparsePoint `
             -Path $previousInstallPath `
             -Label 'previous-install' `
-            -Recurse
+            -Recurse `
+            -MaximumEntries 1024
         [void](New-Item `
             -ItemType Directory `
             -Path $stagedInstallRoot `
             -ErrorAction Stop)
+        Set-ToolkitPrivateDirectoryTree -Root $stagedInstallRoot
         Copy-RestoreDirectoryContents `
             -Source $previousInstallPath `
             -Destination $stagedInstallRoot
         Assert-RestoreNoReparsePoint `
             -Path $stagedInstallRoot `
             -Label '暂存 previous-install' `
-            -Recurse
-        $stagedInstallInventory = @(Get-RestoreDirectoryInventory -Path $stagedInstallRoot)
+            -Recurse `
+            -MaximumEntries 1024
+        $stagedInstallProduct = Get-ToolkitDirectoryStateSnapshot `
+            -Root $stagedInstallRoot `
+            -MaximumFileBytes 25MB `
+            -MaximumEntries 1024 `
+            -MaximumTotalBytes 64MB
+        Assert-ToolkitDirectorySnapshotContainsFileSnapshot `
+            -DirectorySnapshot $stagedInstallProduct `
+            -RelativePath 'CodexOpenRouter\CodexOpenRouter.psd1' `
+            -FileSnapshot $stagedSourceManifestSnapshot `
+            -Label '暂存 previous-install 模块清单'
+        $stagedInstallInventory = @(
+            $stagedInstallProduct.Entries |
+                Where-Object Type -ceq 'file' |
+                ForEach-Object {
+                    "$([string]$_.RelativePath)`t$([long]$_.Length)`t" +
+                        ([string]$_.Sha256).ToUpperInvariant()
+                }
+        )
         Assert-RestoreInventoryEqual `
             -Expected $previousInstallInventory `
             -Actual $stagedInstallInventory `
             -Label '暂存 previous-install'
+        Assert-ToolkitPrivateDirectoryTree -Root $stagedInstallRoot
     }
 
     $commitStarted = $true
@@ -966,54 +1330,85 @@ try {
         if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
             throw '当前安装目录在提交前发生变化。'
         }
-        Assert-RestoreNoReparsePoint -Path $installRoot -Label '当前安装目录' -Recurse
-        Move-Item `
-            -LiteralPath $installRoot `
+        Assert-RestoreNoReparsePoint `
+            -Path $installRoot `
+            -Label '当前安装目录' `
+            -Recurse `
+            -MaximumEntries 1024
+        Move-ToolkitDirectoryIfSnapshotMatches `
+            -Path $installRoot `
             -Destination $currentInstallSnapshot `
-            -Force `
-            -ErrorAction Stop
+            -Snapshot $currentInstallProduct `
+            -State $currentInstallMoveState
         $currentInstallMoved = $true
+        $currentInstallSnapshotProduct = $currentInstallProduct
+        if (Test-Path -LiteralPath $installRoot) {
+            throw '当前安装目录在事务移动后被外部重新创建。'
+        }
     }
     elseif (Test-Path -LiteralPath $installRoot) {
         throw '当前安装路径在提交前发生变化。'
     }
 
     if ($installExisted) {
-        [void](New-Item `
-            -ItemType Directory `
-            -Path $installRoot `
-            -ErrorAction Stop)
+        Move-ToolkitDirectoryIfSnapshotMatches `
+            -Path $stagedInstallRoot `
+            -Destination $installRoot `
+            -Snapshot $stagedInstallProduct `
+            -State $restoredInstallMoveState
         $restoredInstallCreated = $true
-        Copy-RestoreDirectoryContents `
-            -Source $stagedInstallRoot `
-            -Destination $installRoot
+        $restoredInstallProduct = $stagedInstallProduct
+        if (Test-Path -LiteralPath $stagedInstallRoot) {
+            throw '恢复安装目录发布后，staging 路径被外部重新创建。'
+        }
+        Assert-ToolkitPrivateDirectoryTree -Root $installRoot
     }
 
     $commitOrder = @('config', 'catalog', 'active-cache', 'openai-cache', 'profile')
     foreach ($name in $commitOrder) {
         $validated = $validatedFilesByName[$name]
         if ($validated.Existed) {
-            Copy-RestoreFileAtomic `
+            $validated.TransactionProductSnapshot = Copy-RestoreFileAtomic `
                 -Source $validated.StagedPath `
-                -Destination $validated.Target
+                -Destination $validated.Target `
+                -AclSddl $validated.SourceAclSddl `
+                -LastWriteTimeUtc $validated.SourceLastWriteTimeUtc `
+                -ExpectedCurrentSnapshot $validated.CurrentSnapshot `
+                -MaximumBytes ([long]$validated.MaximumBytes) `
+                -PassThru
+            $validated.TransactionModified = $true
+            $validated.TransactionProductExisted = $true
+        }
+        elseif ($validated.CurrentExisted) {
+            Remove-ToolkitFileIfSnapshotMatches `
+                -Path $validated.Target `
+                -Snapshot $validated.CurrentSnapshot
+            $validated.TransactionModified = $true
+            $validated.TransactionProductExisted = $false
         }
         elseif (Test-Path -LiteralPath $validated.Target) {
-            if (-not (Test-Path -LiteralPath $validated.Target -PathType Leaf)) {
-                throw "受管目标在提交期间发生变化：$($validated.Target)"
-            }
-            Assert-RestoreNoReparsePoint `
-                -Path $validated.Target `
-                -Label "受管目标 $name"
-            Remove-Item -LiteralPath $validated.Target -Force -ErrorAction Stop
+            throw "恢复提交 CAS 冲突，保留并发创建的目标：$($validated.Target)"
         }
     }
 
     foreach ($name in $expectedFiles.Keys) {
         $validated = $validatedFilesByName[[string]$name]
         if ($validated.Existed) {
-            if (-not (Test-Path -LiteralPath $validated.Target -PathType Leaf) -or
-                (Get-RestoreSha256 -Path $validated.Target) -cne $validated.SourceSha256) {
+            if (-not (Test-Path -LiteralPath $validated.Target -PathType Leaf)) {
                 throw "恢复后的文件校验失败：$name"
+            }
+            $restoredSnapshot = Get-ToolkitFileSnapshot `
+                -Path $validated.Target `
+                -MaximumBytes ([long]$validated.MaximumBytes)
+            if ($restoredSnapshot.Sha256.ToUpperInvariant() -cne
+                $validated.SourceSha256) {
+                throw "恢复后的文件校验失败：$name"
+            }
+            if ($null -ne $validated.SourceLastWriteTimeUtc) {
+                if ($restoredSnapshot.LastWriteTimeUtc -ne
+                    [DateTime]$validated.SourceLastWriteTimeUtc) {
+                    throw "恢复后的文件 $name 的 LastWriteTimeUtc 校验失败。"
+                }
             }
         }
         elseif (Test-Path -LiteralPath $validated.Target) {
@@ -1031,8 +1426,14 @@ try {
         if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
             throw 'previous-install 未成功恢复。'
         }
-        Assert-RestoreNoReparsePoint -Path $installRoot -Label '恢复后的安装目录' -Recurse
-        $restoredInstallInventory = @(Get-RestoreDirectoryInventory -Path $installRoot)
+        Assert-RestoreNoReparsePoint `
+            -Path $installRoot `
+            -Label '恢复后的安装目录' `
+            -Recurse `
+            -MaximumEntries 1024
+        $restoredInstallInventory = @(Get-RestoreDirectoryInventory `
+            -Path $installRoot `
+            -MaximumFileBytes 25MB)
         Assert-RestoreInventoryEqual `
             -Expected $previousInstallInventory `
             -Actual $restoredInstallInventory `
@@ -1055,6 +1456,36 @@ catch {
     $originalError = $_
     $rollbackErrors = [Collections.Generic.List[string]]::new()
 
+    if (-not $currentInstallMoved -and
+        ([string]$currentInstallMoveState['Disposition'] -notin @(
+                'NoMove',
+                'RevertedToSource'
+            ) -or
+            (Test-Path `
+                -LiteralPath $currentInstallSnapshot `
+                -PathType Container))) {
+        $rollbackErrors.Add(
+            '当前安装目录移动状态未完成验证，候选位置：' +
+                [string]$currentInstallMoveState['CurrentLocation']
+        )
+    }
+    if (-not $restoredInstallCreated -and
+        [string]$restoredInstallMoveState['Disposition'] -notin @(
+            'NoMove',
+            'RevertedToSource'
+        )) {
+        $rollbackErrors.Add(
+            '恢复安装目录发布状态未完成验证，候选位置：' +
+                [string]$restoredInstallMoveState['CurrentLocation']
+        )
+    }
+    if ($restoredInstallCreated -and
+        (Test-Path -LiteralPath $stagedInstallRoot)) {
+        $rollbackErrors.Add(
+            "恢复安装发布后 staging 路径被重新创建，外部候选已保留：$stagedInstallRoot"
+        )
+    }
+
     if ($commitStarted) {
         try {
             if ($restoredInstallCreated -and
@@ -1062,11 +1493,10 @@ catch {
                 if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
                     throw "回滚目标安装路径需要是目录：$installRoot"
                 }
-                Assert-RestoreNoReparsePoint `
+                Remove-ToolkitDirectoryIfSnapshotMatches `
                     -Path $installRoot `
-                    -Label '回滚目标安装目录' `
-                    -Recurse
-                Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction Stop
+                    -Snapshot $restoredInstallProduct `
+                    -AllowInheritedPrivateChildren
                 $restoredInstallCreated = $false
             }
             if ($currentInstallMoved) {
@@ -1078,12 +1508,17 @@ catch {
                         -PathType Container)) {
                     throw '当前安装目录的事务快照不可用。'
                 }
-                Move-Item `
-                    -LiteralPath $currentInstallSnapshot `
+                $rollbackCurrentInstallMoveState = [ordered]@{}
+                Move-ToolkitDirectoryIfSnapshotMatches `
+                    -Path $currentInstallSnapshot `
                     -Destination $installRoot `
-                    -Force `
-                    -ErrorAction Stop
+                    -Snapshot $currentInstallSnapshotProduct `
+                    -State $rollbackCurrentInstallMoveState
+                Assert-ToolkitPrivateDirectoryTree -Root $installRoot
                 $currentInstallMoved = $false
+                $currentInstallMoveState['CurrentLocation'] = $installRoot
+                $currentInstallMoveState['Recovered'] = $true
+                $currentInstallMoveState['Disposition'] = 'RevertedToSource'
             }
         }
         catch {
@@ -1093,22 +1528,30 @@ catch {
         foreach ($name in $expectedFiles.Keys) {
             $validated = $validatedFilesByName[[string]$name]
             try {
+                if (-not $validated.TransactionModified) {
+                    continue
+                }
                 if ($validated.CurrentExisted) {
                     if (-not (Test-Path -LiteralPath $validated.SnapshotPath -PathType Leaf)) {
                         throw '事务快照缺失。'
                     }
                     Copy-RestoreFileAtomic `
                         -Source $validated.SnapshotPath `
-                        -Destination $validated.Target
+                        -Destination $validated.Target `
+                        -AclSddl $validated.CurrentAclSddl `
+                        -LastWriteTimeUtc $validated.CurrentLastWriteTimeUtc `
+                        -MaximumBytes ([long]$validated.MaximumBytes) `
+                        -ExpectedCurrentSnapshot $(if (
+                            $validated.TransactionProductExisted
+                        ) {
+                            $validated.TransactionProductSnapshot
+                        }
+                        else { $null })
                 }
-                elseif (Test-Path -LiteralPath $validated.Target) {
-                    if (-not (Test-Path -LiteralPath $validated.Target -PathType Leaf)) {
-                        throw '回滚目标已变成目录。'
-                    }
-                    Assert-RestoreNoReparsePoint `
+                elseif ($validated.TransactionProductExisted) {
+                    Remove-ToolkitFileIfSnapshotMatches `
                         -Path $validated.Target `
-                        -Label "回滚目标 $name"
-                    Remove-Item -LiteralPath $validated.Target -Force -ErrorAction Stop
+                        -Snapshot $validated.TransactionProductSnapshot
                 }
             }
             catch {
@@ -1124,15 +1567,38 @@ catch {
     throw "恢复失败，已还原事务前状态：$($originalError.Exception.Message)"
 }
 finally {
+    $transactionRetainsMovedDirectory = -not $restoreSucceeded -and (
+        (Test-Path `
+            -LiteralPath $currentInstallSnapshot `
+            -PathType Container) -or
+        [string]$currentInstallMoveState['Disposition'] -notin @(
+            'NoMove',
+            'RevertedToSource',
+            'AtDestinationValidated'
+        ) -or
+        [string]$restoredInstallMoveState['Disposition'] -notin @(
+            'NoMove',
+            'RevertedToSource',
+            'AtDestinationValidated'
+        )
+    )
     $canCleanTransaction = $restoreSucceeded -or
-        -not $commitStarted -or
-        $rollbackCompleted
+        ($commitStarted -and $rollbackCompleted -and
+            -not $transactionRetainsMovedDirectory)
     if ($transactionCreated -and
         $canCleanTransaction -and
         (Test-Path -LiteralPath $transactionRoot)) {
         try {
             Assert-RestoreNoReparsePoint -Path $transactionRoot -Label '事务目录' -Recurse
-            Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction Stop
+            Assert-ToolkitPrivateDirectoryTree -Root $transactionRoot
+            $transactionProduct = Get-ToolkitDirectoryStateSnapshot `
+                -Root $transactionRoot `
+                -MaximumFileBytes 50MB `
+                -MaximumEntries 4096 `
+                -MaximumTotalBytes 512MB
+            Remove-ToolkitDirectoryIfSnapshotMatches `
+                -Path $transactionRoot `
+                -Snapshot $transactionProduct
         }
         catch {
             if ($restoreSucceeded) {

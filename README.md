@@ -80,17 +80,17 @@ OpenRouter 的公开 `GET /api/v1/models` 当前返回顶层 `data` 数组。Cod
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 ```
 
-脚本接受带 `sk-or-` 前缀的 OpenRouter Key，隐藏输入，并默认把 Key 保存到当前 Windows 用户的环境变量中，同时让当前安装进程立即可用。Key 不会出现在命令历史里。
+脚本接受带 `sk-or-` 前缀的 OpenRouter Key，隐藏输入，并默认把 Key 保存到当前 Windows 用户的环境变量中。设置完成后会通知 Windows Shell 刷新环境。Key 不会出现在命令历史里。`cxor` 启动 Codex Desktop 时要求有效的 `User` 范围 Key。
 
-只让当前 PowerShell 进程使用：
+只让当前 PowerShell 进程用于目录刷新或临时诊断：
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process
 ```
 
-`Process` 范围需要点号加载到准备运行 `cxor` 的同一个 PowerShell 会话中；关闭窗口后自动失效。
+`Process` 范围需要点号加载到同一个 PowerShell 会话中，关闭窗口后自动失效。Windows 打包桌面应用无法可靠继承这类临时值，因此仅有 `Process` 范围 Key 时，`cxor` 会停止并提示设置 `User` 范围 Key。
 
-轮换时重新运行同一个脚本。使用默认的 `User` 范围轮换后，请关闭并重新打开 PowerShell，再运行 `cxor`；已有窗口可能继续持有旧的 `Process` 值。需要立即更新当前窗口时，使用上面的 `-Scope Process` 点号加载命令。
+轮换时重新运行同一个脚本，再运行 `cxor` 让桌面端以新 Key 重启。曾在旧 PowerShell 中显式设置 `Process` override 时，请清除该 override 或关闭旧窗口，避免它与新的 `User` 值冲突。
 
 删除 Key 需要显式指定：
 
@@ -98,7 +98,7 @@ pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1 -Remove
 ```
 
-该命令删除 Windows 用户级 Key。随后关闭所有既有 PowerShell 窗口与 Codex Desktop，再重新打开；这些进程可能仍保留启动时继承的旧值。需要立即清除当前 PowerShell 的进程级 Key 时，使用：
+该命令删除 Windows 用户级 Key 并通知 Windows Shell。随后关闭既有 Codex Desktop；已经运行的进程可能仍保留启动时继承的旧值。需要立即清除当前 PowerShell 的进程级 Key 时，使用：
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process -Remove
@@ -250,6 +250,7 @@ pwsh -NoProfile -File .\scripts\Restore-CodexOpenRouterBackup.ps1 `
 - 文件、终端、补丁和审批等本机工具继续由 Codex 客户端执行；具体工具能力取决于 Codex 版本和所选模型。
 - OpenRouter 模型出现在列表中，只表示目录可见。Responses 接口、图像、搜索、结构化工具和补丁支持仍需分别验证。
 - 本地备份可能继承原 Codex 配置中的敏感内容。备份留在 `.codex` 下，严禁提交到 Git 或发送给他人。
+- Windows 常规非提权模式仅保证 Owner、Group 与 DACL；SACL 不会加载、保存、比较或恢复。带审计要求的文件超出 ACL 保真范围，原子替换可能影响其审计元数据。
 - 仓库不包含 API Key、真实配置、模型目录、缓存、日志、SQLite、安装 ID、原始 Codex 系统提示或个人路径。
 
 ## 测试
@@ -268,11 +269,11 @@ pwsh -NoProfile -File .\tests\Run-Tests.ps1
 - OpenAI/OpenRouter 顶层配置切换。
 - TOML 注入、语义重复键、quoted/dotted/inline/array-table 冲突、伪表头、合法多行字符串与嵌套数组边界。
 - 异常目录结构、Unicode 转义敏感内容、超限子进程输出与 PATH 阴影程序拒绝。
-- 空文件、带空格路径下的安装、重复安装、schema 2 摘要恢复与卸载。
+- 空文件、带空格路径下的安装、重复安装、schema 3 摘要/时间戳恢复、schema 1/2 兼容与卸载。
 - 恶意恢复清单、旧安装篡改、安装目录 ownership、部分目录复制和设置路径篡改拒绝。
-- 切换失败事务回滚与卸载时的 OpenAI 缓存恢复。
+- 供应商配置/模型缓存切换失败的 CAS 回滚、空桌面进程路径与卸载时的 OpenAI 缓存恢复；目录刷新作为独立前置维护动作单独提交。
 - Profile 既有内容、here-string 数据保护与旧版受管区块迁移。
-- 受保护 Windows ACL 的原子替换、缺失文件恢复与尾分隔符等价的跨进程锁。
+- Windows 私有备份 DACL、Owner/Group/DACL 策略恢复、原子替换与尾分隔符等价的跨进程锁。
 
 自动测试只使用本地夹具与临时目录。CI 不注入 OpenRouter API Key，也不执行联网目录刷新、真实推理请求或 Codex Desktop 重启。
 
@@ -280,7 +281,7 @@ pwsh -NoProfile -File .\tests\Run-Tests.ps1
 
 Live smoke 只在受控的本机 PowerShell 中手动执行，可能产生 OpenRouter token 费用：
 
-1. 设置或轮换专用低额度 Key；使用 `User` 范围时重新打开 PowerShell。
+1. 设置或轮换专用低额度的 `User` 范围 Key；随后运行 `cxor` 重启桌面端。
 2. 运行 `cxor -ForceRefresh`，随后用 `Get-CodexOpenRouterStatus | Format-List` 检查 provider、目录年龄和提示一致性。
 3. 在 Codex Desktop 中新建任务，选择目标模型，先执行一个普通问答，再按需执行一个低风险只读工具任务。
 4. 完成后运行 `cx` 恢复 Codex 默认配置。

@@ -80,17 +80,17 @@ The persistent OpenRouter provider configuration uses `env_key = "OPENROUTER_API
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 ```
 
-The script accepts OpenRouter keys with the `sk-or-` prefix, hides input, and saves the key to the current Windows user's environment variables by default. It also makes the key available to the installation process. The key value stays out of command history.
+The script accepts OpenRouter keys with the `sk-or-` prefix, hides input, and saves the key to the current Windows user's environment variables by default. It then notifies Windows Shell that the environment changed. The key value stays out of command history. Launching Codex Desktop through `cxor` requires a valid `User`-scoped key.
 
-To use the key only in the current PowerShell process:
+To use the key only for catalog refresh or temporary diagnostics in the current PowerShell process:
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process
 ```
 
-The `Process` scope must be dot-sourced in the same PowerShell session that will run `cxor`. Closing that window removes the process-scoped value.
+The `Process` scope must be dot-sourced in the same PowerShell session, and closing that window removes the value. A packaged Windows desktop app cannot reliably inherit this temporary value, so `cxor` stops and requests a `User`-scoped key when only a `Process` value is available.
 
-Run the same script again to rotate the key. After rotating the default `User`-scoped value, close and reopen PowerShell before running `cxor`; an existing window may still hold an older `Process`-scoped value. To update the current window immediately, use the dot-sourced `-Scope Process` command above.
+Run the same script again to rotate the key, then run `cxor` to restart Codex Desktop with the new value. If an older PowerShell window has an explicit `Process` override, clear that override or close the window to avoid a conflict with the new `User` value.
 
 Removal requires an explicit option:
 
@@ -98,7 +98,7 @@ Removal requires an explicit option:
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1 -Remove
 ```
 
-This command removes the Windows user-scoped key. Close every existing PowerShell window and Codex Desktop before reopening them because those processes may still retain an inherited value. To remove the process-scoped key from the current PowerShell session immediately, use:
+This command removes the Windows user-scoped key and notifies Windows Shell. Close any running Codex Desktop instance because an existing process may retain the value it inherited at startup. To remove a process-scoped key from the current PowerShell session immediately, use:
 
 ```powershell
 . .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process -Remove
@@ -250,6 +250,7 @@ Restoration overwrites the profile, Codex configuration, catalog, and caches lis
 - Local tools for files, terminals, patches, and approvals continue to run through the Codex client. Exact tool capabilities depend on the Codex version and selected model.
 - A model appearing in the list confirms catalog visibility. Responses API, image, search, structured tool, and patch support still require individual verification.
 - Local backups may inherit sensitive data from an existing Codex configuration. Keep backups under `.codex`; never commit or share them.
+- Normal non-elevated Windows operation guarantees Owner, Group, and DACL handling only. SACL data is not loaded, saved, compared, or restored. Files with audit requirements are outside the ACL-fidelity guarantee, and atomic replacement may affect their audit metadata.
 - The repository contains no API keys, real configurations, model catalogs, caches, logs, SQLite databases, installation IDs, original Codex system instructions, or personal paths.
 
 ## Testing
@@ -268,11 +269,11 @@ The test suite covers:
 - Top-level OpenAI/OpenRouter configuration switching.
 - TOML injection, semantic duplicate keys, quoted/dotted/inline/array-table conflicts, fake headers, and valid multiline-string and nested-array boundaries.
 - Rejection of malformed catalogs, Unicode-escaped sensitive values, oversized child-process output, and PATH-shadowed executables.
-- Empty-file handling plus installation, repeated installation, schema 2 inventory restoration, and removal under paths containing spaces.
+- Empty-file handling plus installation, repeated installation, schema 3 inventory/timestamp restoration, schema 1/2 compatibility, and removal under paths containing spaces.
 - Rejection of malicious restore manifests, modified previous installations, unowned installation directories, partial directory copies, and modified settings paths.
-- Transaction rollback after failed switching and OpenAI cache restoration during removal.
+- CAS rollback after provider-configuration/model-cache switching failures, the empty Desktop-process path, and OpenAI cache restoration during removal. Catalog refresh is committed separately as a prerequisite maintenance operation.
 - Protection of existing profile and here-string content, plus migration of the legacy managed block.
-- Atomic replacement and missing-file restoration under protected Windows ACLs, plus cross-process lock equivalence for trailing separators.
+- Private Windows backup DACLs, Owner/Group/DACL policy restoration, atomic replacement, and cross-process lock equivalence for trailing separators.
 
 Automated tests use only local fixtures and temporary directories. CI receives no OpenRouter API key and does not perform network catalog refresh, live inference, or Codex Desktop restart.
 
@@ -280,7 +281,7 @@ Automated tests use only local fixtures and temporary directories. CI receives n
 
 Run the live smoke test only from a controlled local PowerShell session. It may consume billable OpenRouter tokens:
 
-1. Set or rotate a dedicated low-limit key. Open a new PowerShell window when using `User` scope.
+1. Set or rotate a dedicated low-limit `User`-scoped key, then run `cxor` to restart Codex Desktop.
 2. Run `cxor -ForceRefresh`, then inspect provider state, catalog age, and instruction consistency with `Get-CodexOpenRouterStatus | Format-List`.
 3. Create a new Codex Desktop task, select the target model, try a normal question, and optionally run one low-risk read-only tool task.
 4. Run `cx` when finished to restore the Codex default configuration.

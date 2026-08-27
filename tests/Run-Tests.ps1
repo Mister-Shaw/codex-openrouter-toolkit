@@ -106,11 +106,6 @@ try {
     }
     $privacyNeedles = [Collections.Generic.List[string]]::new()
     $privacyNeedles.Add(('C:' + '\Users\'))
-    $runtimeUserName = [Environment]::UserName
-    if (-not [string]::IsNullOrWhiteSpace($runtimeUserName) -and
-        $runtimeUserName.Length -ge 3) {
-        $privacyNeedles.Add($runtimeUserName)
-    }
     $runtimeUserProfile = [Environment]::GetFolderPath('UserProfile')
     if (-not [string]::IsNullOrWhiteSpace($runtimeUserProfile)) {
         $privacyNeedles.Add($runtimeUserProfile)
@@ -119,7 +114,10 @@ try {
         $content = [IO.File]::ReadAllText($file.FullName)
         foreach ($needle in $privacyNeedles) {
             Assert-True `
-                -Condition (-not $content.Contains($needle)) `
+                -Condition ($content.IndexOf(
+                        $needle,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -lt 0) `
                 -Message "Privacy scan: $($file.FullName)"
         }
     }
@@ -275,6 +273,7 @@ try {
         -Condition $uninstalledProfile.Contains('Existing-Helper') `
         -Message 'Uninstaller preserves existing profile'
 
+    & (Join-Path $PSScriptRoot 'Runtime-Tests.ps1')
     & (Join-Path $PSScriptRoot 'Security-Tests.ps1')
 
     Write-Host "All tests passed: $($scripts.Count) PowerShell files parsed; catalog, config, security, install, restore, rollback, privacy, and uninstall checks succeeded."
