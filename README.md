@@ -1,5 +1,7 @@
 # Codex OpenRouter Toolkit
 
+**简体中文** | [English](README_EN.md)
+
 一个面向 Windows 的社区工具包，用于在 Codex Desktop 保存的 OpenAI 配置与 OpenRouter 之间快速切换、自动维护 OpenRouter 模型目录，并给 OpenRouter 模型应用轻量 Agent 提示。
 
 工具包保留工具调用、权限边界、审批、补丁、验证和结果真实性规则，同时减少固定身份、固定文风与固定输出格式，让不同模型更充分地展现自身能力和中文写作风格。
@@ -48,7 +50,7 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 安装器会完成以下操作：
 
 1. 动态解析当前用户的 PowerShell Profile、`.codex` 目录和 Codex CLI。
-2. 把 Profile、Codex 配置、目录和缓存快照留在 `.codex\codex-openrouter-toolkit-backups`。
+2. 把 Profile、Codex 配置、目录和缓存快照留在 `<CODEX_HOME>\codex-openrouter-toolkit-backups`。
 3. 安装 PowerShell 模块。
 4. 在 Profile 中加入一段带明确标记的 `Import-Module`。
 5. 合并 OpenRouter provider 配置，同时保留其他 TOML 表。
@@ -106,7 +108,7 @@ cxor
 
 切换成功后，进入 Codex Desktop 的新任务，从模型列表中选择目录里的模型。
 
-恢复安装时记录的 OpenAI 配置：
+恢复安装时记录的 OpenAI 模型与推理强度：
 
 ```powershell
 cx
@@ -169,6 +171,8 @@ Update-OpenRouterModelCatalog
 
 OpenAI Docs 建议删除重复指令、简化工具说明、保留紧凑的授权边界，并使用代表性任务验证变化：[Model guidance](https://developers.openai.com/api/docs/guides/latest-model)。
 
+不同 OpenRouter 模型对提示和工具的遵循程度可能不同，建议用实际任务逐一验证。
+
 ## 更新
 
 ```powershell
@@ -184,7 +188,7 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 ```
 
-默认流程会恢复保存的 OpenAI 模型配置、移除受管 Profile 区块，并把安装文件移动到可恢复目录。OpenRouter Key 会保留。
+默认流程会恢复保存的 OpenAI 模型与推理强度、移除受管 Profile 区块，并把安装文件移动到可恢复目录。OpenRouter Key 会保留。
 
 保留当前供应商配置：
 
@@ -239,9 +243,8 @@ pwsh -NoProfile -File .\tests\Run-Tests.ps1
 
 ## 故障排查
 
-常见问题见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
+常见问题见 [中文故障排查](docs/TROUBLESHOOTING.md)；英文版本见 [Troubleshooting](docs/TROUBLESHOOTING_EN.md)。
 
 ## 许可证
 
 MIT。许可证只覆盖本仓库的原创代码与文档。OpenAI、Codex、OpenRouter 及相关名称归各自权利人所有。
-
