@@ -1643,6 +1643,9 @@ try {
         elseif ($semanticActualAcl.Sddl.Contains('D:P')) {
             $semanticActualAcl.Sddl.Replace('D:P', 'D:PAI')
         }
+        elseif ($semanticActualAcl.Sddl.Contains('D:')) {
+            $semanticActualAcl.Sddl.Replace('D:', 'D:AI')
+        }
         else {
             throw 'Unable to build a semantic ACL metadata variant.'
         }
