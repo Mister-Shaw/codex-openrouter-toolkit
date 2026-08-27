@@ -19,7 +19,7 @@ Confirm that Codex Desktop is installed and has been launched at least once:
 Get-CodexCliPath
 ```
 
-The toolkit checks for `codex.exe` on `PATH`, followed by the Codex Desktop installation directory under the current user's `LocalAppData`.
+The toolkit accepts only `codex.exe` bundled under the current user's `LocalAppData\OpenAI\Codex\bin` when its Authenticode signature is valid and its signer subject matches OpenAI. A same-named executable on `PATH` is ignored.
 
 ## The API key cannot be read
 
@@ -34,6 +34,12 @@ Status output reports only whether the key is available and never prints its val
 
 ```powershell
 Get-CodexOpenRouterStatus
+```
+
+The script accepts OpenRouter keys with the `sk-or-` prefix and rejects whitespace or control characters. After setting or rotating the default `User`-scoped value, close and reopen PowerShell. An existing window may retain an older `Process`-scoped value. To update the current window immediately, dot-source the process-scoped script:
+
+```powershell
+. .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process
 ```
 
 ## HTTP 401
@@ -53,6 +59,18 @@ Check these items in order:
 3. Compatibility with the Responses API.
 4. Support for the tools, images, or patch operations required by the task.
 
+## A direct `/api/v1/models` request contains only `data`
+
+This is the current response shape of OpenRouter's public endpoint. Codex Desktop requires a top-level `models` structure and additional compatibility fields. Use the toolkit refresh to generate an authenticated Codex-compatible catalog. Do not rename the public response and write it to `model_catalog_json` manually:
+
+```powershell
+cxor -ForceRefresh -NoRestart
+```
+
+The persistent provider's `env_key` is used for inference. Isolated `command` authentication created by the refresh flow is limited to catalog refresh, and its temporary `CODEX_HOME` is removed when the flow ends.
+
+Upgrade removes the legacy persistent `[model_providers.openrouter.auth]` table. Inline or dotted `auth` declarations stop the merge; back up `config.toml`, remove that authentication declaration manually, and rerun installation.
+
 ## The model list is empty or stale
 
 ```powershell
@@ -61,6 +79,8 @@ Get-CodexOpenRouterStatus | Format-List
 ```
 
 The refreshed catalog is checked for valid JSON, model-count bounds, unique slugs, the configured default model, and supported instruction fields. If validation fails, the last valid catalog remains available.
+
+Every `cxor` run checks catalog age. A valid catalog younger than 24 hours is reused, while a catalog at or beyond the threshold is refreshed. `-ForceRefresh` bypasses the age condition.
 
 ## Models keep identifying themselves as Codex CLI
 
@@ -76,6 +96,10 @@ If the status remains `False`, confirm that the installed `lightweight-agent-pro
 ## The old model remains visible after switching
 
 Close Codex Desktop completely, launch it again, and create a new task. Model lists and system instructions are generally loaded when a new task starts.
+
+## OpenRouter models remain visible after uninstalling
+
+Default removal restores the OpenAI configuration captured during installation and restores the OpenAI model cache when a snapshot is available. Close Codex Desktop completely, launch it again, and create a new task. Removal with `-KeepCurrentProvider` preserves the active provider configuration.
 
 ## Codex Desktop does not restart automatically
 
@@ -103,4 +127,4 @@ pwsh -NoProfile -File .\scripts\Restore-CodexOpenRouterBackup.ps1 `
   -Force
 ```
 
-Preserve any current configuration changes and close Codex Desktop before rollback.
+Preserve any current configuration changes and close Codex Desktop before rollback. Restore validates a per-file inventory of the previous installation and toolkit ownership of the current installation directory. If an automatic rollback encounters a file lock or permission failure, the error reports a retained transaction-snapshot path; copy that directory before further recovery work.

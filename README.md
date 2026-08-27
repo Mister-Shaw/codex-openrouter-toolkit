@@ -13,11 +13,11 @@
 
 - `cxor`：准备模型目录、应用轻量提示、切换到 OpenRouter，并可重启 Codex Desktop。
 - `cx`：恢复安装时记录的 OpenAI 模型与推理强度。
-- 每 24 小时自动检查 OpenRouter 模型目录，也可强制刷新。
+- 每次运行 `cxor` 都检查 OpenRouter 模型目录年龄；达到 24 小时后刷新，也可随时强制刷新。
 - 同时兼容 `model_messages.instructions_template` 与 `base_instructions` 两种目录结构。
 - 下载失败时保留最后一个有效目录。
 - API Key 通过隐藏输入设置，脚本、TOML、目录和日志均不保存密钥正文。
-- 安装、升级、切换、卸载前采用备份或原子写入。
+- 安装和升级会创建时间戳备份；受管文本配置通过临时文件替换。
 - 支持 `-NoRestart`，便于保留当前桌面任务。
 - 提供自包含测试，无需 Pester。
 
@@ -29,7 +29,7 @@
 - 有效的 OpenRouter API Key
 - 网络能够访问 `https://openrouter.ai`
 
-当前版本基于 Codex Desktop/CLI `0.150.0-alpha.8` 验证。Windows PowerShell 5.1 不在支持范围内。
+工具包 `0.1.1` 基于 Codex Desktop/CLI `0.150.0-alpha.8` 验证。Windows PowerShell 5.1 不在支持范围内。
 
 ## 快速安装
 
@@ -49,11 +49,11 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 
 安装器会完成以下操作：
 
-1. 动态解析当前用户的 PowerShell Profile、`.codex` 目录和 Codex CLI。
+1. 动态解析当前用户的 PowerShell Profile 与 `.codex` 目录；目录刷新只采用 Codex Desktop 内置且签名有效的 CLI。
 2. 把 Profile、Codex 配置、目录和缓存快照留在 `<CODEX_HOME>\codex-openrouter-toolkit-backups`。
 3. 安装 PowerShell 模块。
 4. 在 Profile 中加入一段带明确标记的 `Import-Module`。
-5. 合并 OpenRouter provider 配置，同时保留其他 TOML 表。
+5. 合并 OpenRouter provider 配置，同时保留无冲突的自定义字段与其他 TOML 表。
 6. 记录安装前的 OpenAI 模型和推理强度，供 `cx` 恢复。
 
 已有早期版本的 `Codex desktop provider shortcuts` 标记区块会在备份后迁移到模块方案。Profile 的其他内容会保留。
@@ -68,13 +68,19 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1 `
 
 默认 OpenRouter 模型必须存在于下载后的目录中。模型下架或改名时，可以重新运行安装器并传入新的模型 ID。
 
+### 模型目录格式与认证职责
+
+OpenRouter 的公开 `GET /api/v1/models` 当前返回顶层 `data` 数组。Codex Desktop 使用的模型目录需要顶层 `models` 结构及额外的兼容字段。工具包对固定地址发起经过认证的目录请求；检测到 `data` 结构后立即转入受信 Codex CLI 的兼容刷新流程，生成并验证 Codex 可读取的目录。公开端点的响应不会直接写入 `model_catalog_json`。
+
+持久化 OpenRouter provider 配置中的 `env_key = "OPENROUTER_API_KEY"` 用于日常推理请求。目录刷新会在临时 `CODEX_HOME` 中创建隔离的 `command` auth，它只为目录刷新进程提供认证；刷新结束后会清理该临时目录。升级时会移除旧版持久化 `[model_providers.openrouter.auth]` 表并迁移到 `env_key`。Inline 或 dotted `auth` 配置会触发安全拒绝，请先手动整理配置。
+
 ## 设置或轮换 API Key
 
 ```powershell
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 ```
 
-脚本会隐藏输入，并默认把 Key 保存到当前 Windows 用户的环境变量中，同时让当前安装进程立即可用。Key 不会出现在命令历史里。
+脚本接受带 `sk-or-` 前缀的 OpenRouter Key，隐藏输入，并默认把 Key 保存到当前 Windows 用户的环境变量中，同时让当前安装进程立即可用。Key 不会出现在命令历史里。
 
 只让当前 PowerShell 进程使用：
 
@@ -84,10 +90,18 @@ pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1
 
 `Process` 范围需要点号加载到准备运行 `cxor` 的同一个 PowerShell 会话中；关闭窗口后自动失效。
 
-轮换时重新运行同一个脚本。删除 Key 需要显式指定：
+轮换时重新运行同一个脚本。使用默认的 `User` 范围轮换后，请关闭并重新打开 PowerShell，再运行 `cxor`；已有窗口可能继续持有旧的 `Process` 值。需要立即更新当前窗口时，使用上面的 `-Scope Process` 点号加载命令。
+
+删除 Key 需要显式指定：
 
 ```powershell
 pwsh -NoProfile -File .\scripts\Set-CodexOpenRouterKey.ps1 -Remove
+```
+
+该命令删除 Windows 用户级 Key。随后关闭所有既有 PowerShell 窗口与 Codex Desktop，再重新打开；这些进程可能仍保留启动时继承的旧值。需要立即清除当前 PowerShell 的进程级 Key 时，使用：
+
+```powershell
+. .\scripts\Set-CodexOpenRouterKey.ps1 -Scope Process -Remove
 ```
 
 Windows 用户级环境变量属于便捷凭据存储。建议创建专用、低额度 Key，定期轮换，并在 OpenRouter 账户中监控用量。
@@ -105,6 +119,8 @@ Windows 用户级环境变量属于便捷凭据存储。建议创建专用、低
 ```powershell
 cxor
 ```
+
+每次执行 `cxor` 都会检查目录是否存在、是否有效以及文件年龄。有效目录未达到 24 小时时会继续复用；达到年龄阈值、目录无效或指定 `-ForceRefresh` 时会触发刷新。
 
 切换成功后，进入 Codex Desktop 的新任务，从模型列表中选择目录里的模型。
 
@@ -182,13 +198,22 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 
 重复安装会更新同一受管 Profile 区块，并创建新的时间戳备份。
 
+首次安装若传入了自定义 `-ProfilePath`，后续更新也需要显式传入同一路径。升级流程会核对该路径，防止被篡改的设置文件把受管区块写到其他脚本。
+
 ## 卸载
 
 ```powershell
 pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 ```
 
-默认流程会恢复保存的 OpenAI 模型与推理强度、移除受管 Profile 区块，并把安装文件移动到可恢复目录。OpenRouter Key 会保留。
+默认流程会恢复保存的 OpenAI 模型、推理强度和可用的 OpenAI 模型缓存，移除受管 Profile 区块，并把安装文件移动到可恢复目录。OpenRouter Key 会保留。
+
+使用自定义 Profile 安装时，卸载也要传入同一个路径：
+
+```powershell
+pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1 `
+  -ProfilePath 'D:\PowerShell\Microsoft.PowerShell_profile.ps1'
+```
 
 保留当前供应商配置：
 
@@ -202,6 +227,8 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1 -KeepCurrentProvid
 pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1 -RemoveApiKey
 ```
 
+卸载器会删除 Windows 用户级 Key。卸载后也要关闭既有 PowerShell 与 Codex Desktop，或在当前 PowerShell 中点号加载上述 `-Scope Process -Remove` 命令，以清除已继承的进程级值。
+
 ## 恢复安装前备份
 
 先查看安装器输出的 `BackupPath` 和其中的 `manifest.json`，确认目标后执行：
@@ -212,11 +239,14 @@ pwsh -NoProfile -File .\scripts\Restore-CodexOpenRouterBackup.ps1 `
   -Force
 ```
 
+备份来自自定义 Codex Home 或 Profile 时，同时传入原来的 `-CodexHome` 与 `-ProfilePath`。恢复器只接受固定备份根目录的直接子目录，并会核对五个受管文件、旧安装逐文件摘要、工具包身份、安装状态与目标路径。恢复期间的可变状态在同一跨进程锁内重新检查；回滚未完整完成时会保留事务快照并报告路径。
+
 恢复操作会覆盖清单列出的 Profile、Codex 配置、目录与缓存。执行前请关闭 Codex Desktop，并保存安装后的重要配置变化。
 
 ## 数据流与隐私
 
 - 使用 OpenRouter 模型时，对话内容和模型请求会经过 OpenRouter，并可能传输给所选模型的下游供应商。请阅读各方的数据政策。
+- 持久化 provider 的 `env_key` 负责推理认证；临时隔离的 `command` auth 只用于取得 Codex 兼容模型目录。
 - 文件、终端、补丁和审批等本机工具继续由 Codex 客户端执行；具体工具能力取决于 Codex 版本和所选模型。
 - OpenRouter 模型出现在列表中，只表示目录可见。Responses 接口、图像、搜索、结构化工具和补丁支持仍需分别验证。
 - 本地备份可能继承原 Codex 配置中的敏感内容。备份留在 `.codex` 下，严禁提交到 Git 或发送给他人。
@@ -231,15 +261,31 @@ pwsh -NoProfile -File .\tests\Run-Tests.ps1
 测试覆盖：
 
 - 所有 PowerShell 文件的 AST 解析。
-- API Key 与个人路径扫描。
-- 新旧目录结构的提示写入、复读和幂等性。
+- API Key、个人路径扫描与 API-Key 形态参数的写入前拒绝。
+- 新旧目录结构的提示重写、写入后读回校验和幂等性。
 - 重复模型 slug 拒绝。
 - OpenRouter provider 表合并与其他 TOML 表保留。
 - OpenAI/OpenRouter 顶层配置切换。
-- 带空格路径下的安装、重复安装与卸载。
-- Profile 既有内容保护与旧版受管区块迁移。
+- TOML 注入、语义重复键、quoted/dotted/inline/array-table 冲突、伪表头、合法多行字符串与嵌套数组边界。
+- 异常目录结构、Unicode 转义敏感内容、超限子进程输出与 PATH 阴影程序拒绝。
+- 空文件、带空格路径下的安装、重复安装、schema 2 摘要恢复与卸载。
+- 恶意恢复清单、旧安装篡改、安装目录 ownership、部分目录复制和设置路径篡改拒绝。
+- 切换失败事务回滚与卸载时的 OpenAI 缓存恢复。
+- Profile 既有内容、here-string 数据保护与旧版受管区块迁移。
+- 受保护 Windows ACL 的原子替换、缺失文件恢复与尾分隔符等价的跨进程锁。
 
-联网目录刷新和桌面端重启保持为人工测试，避免 CI 产生费用或受外部服务波动影响。
+自动测试只使用本地夹具与临时目录。CI 不注入 OpenRouter API Key，也不执行联网目录刷新、真实推理请求或 Codex Desktop 重启。
+
+### 手动 live smoke
+
+Live smoke 只在受控的本机 PowerShell 中手动执行，可能产生 OpenRouter token 费用：
+
+1. 设置或轮换专用低额度 Key；使用 `User` 范围时重新打开 PowerShell。
+2. 运行 `cxor -ForceRefresh`，随后用 `Get-CodexOpenRouterStatus | Format-List` 检查 provider、目录年龄和提示一致性。
+3. 在 Codex Desktop 中新建任务，选择目标模型，先执行一个普通问答，再按需执行一个低风险只读工具任务。
+4. 完成后运行 `cx` 恢复 Codex 默认配置。
+
+该流程不会在 GitHub Actions 中运行，也不应把真实 Key 添加到仓库 Secrets 供本项目 CI 使用。
 
 ## 故障排查
 

@@ -7,6 +7,8 @@
 *.bak
 *.bak-*
 *.tmp-*
+*.rollback-*
+*.discard-*
 models_cache*.json
 openrouter-model-catalog*.json
 settings.json

@@ -11,8 +11,46 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pwsh:
+          - '7.4.0'
+          - current
+    env:
+      OPENROUTER_API_KEY: ''
     steps:
-      - uses: actions/checkout@v5
-      - name: Run self-contained tests
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install PowerShell 7.4 test runtime
+        if: matrix.pwsh == '7.4.0'
         shell: pwsh
-        run: ./tests/Run-Tests.ps1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archivePath = Join-Path $env:RUNNER_TEMP 'PowerShell-7.4.0-win-x64.zip'
+          $runtimePath = Join-Path $env:RUNNER_TEMP 'powershell-7.4.0'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.4.0/PowerShell-7.4.0-win-x64.zip' `
+            -OutFile $archivePath
+          $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+          $expectedHash = '62151DB1D98A8B56AEB249CC8A3CE17948F1C83B4062DAC8D0C4302DE71CBD75'
+          if ($actualHash -cne $expectedHash) {
+              throw "PowerShell 7.4.0 archive hash mismatch: $actualHash"
+          }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $runtimePath
+      - name: Run self-contained tests on PowerShell ${{ matrix.pwsh }}
+        shell: pwsh
+        run: |
+          $runtime = if ('${{ matrix.pwsh }}' -eq 'current') {
+              (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
+          }
+          else {
+              Join-Path $env:RUNNER_TEMP 'powershell-7.4.0\pwsh.exe'
+          }
+          & $runtime -NoLogo -NoProfile -File .\tests\Run-Tests.ps1
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }

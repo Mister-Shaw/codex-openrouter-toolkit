@@ -75,7 +75,7 @@ try {
         -LiteralPath $moduleManifest).ModuleVersion.ToString()
     Assert-Equal `
         -Actual $moduleVersion `
-        -Expected '0.1.0' `
+        -Expected '0.1.1' `
         -Message 'Module version'
     $installerText = [IO.File]::ReadAllText($installerPath)
     Assert-True `
@@ -91,7 +91,7 @@ try {
         -File |
         Where-Object { $_.Extension -in @('.ps1', '.psm1', '.psd1', '.md', '.txt', '.json', '.yml') })
     $secretPatterns = @(
-        'sk-or-v1-[A-Za-z0-9_-]{20,}',
+        'sk-or-[A-Za-z0-9._-]{20,}',
         'github_pat_[A-Za-z0-9_]{20,}',
         'gh[pousr]_[A-Za-z0-9_]{20,}',
         'AKIA[0-9A-Z]{16}'
@@ -104,11 +104,17 @@ try {
                 -Message "Secret scan: $($file.FullName)"
         }
     }
-    $privacyNeedles = @(
-        ('C:' + '\Users\'),
-        ('13' + '407'),
-        ('sandra' + 'jordanw232')
-    )
+    $privacyNeedles = [Collections.Generic.List[string]]::new()
+    $privacyNeedles.Add(('C:' + '\Users\'))
+    $runtimeUserName = [Environment]::UserName
+    if (-not [string]::IsNullOrWhiteSpace($runtimeUserName) -and
+        $runtimeUserName.Length -ge 3) {
+        $privacyNeedles.Add($runtimeUserName)
+    }
+    $runtimeUserProfile = [Environment]::GetFolderPath('UserProfile')
+    if (-not [string]::IsNullOrWhiteSpace($runtimeUserProfile)) {
+        $privacyNeedles.Add($runtimeUserProfile)
+    }
     foreach ($file in $textFiles) {
         $content = [IO.File]::ReadAllText($file.FullName)
         foreach ($needle in $privacyNeedles) {
@@ -259,6 +265,7 @@ try {
     $uninstallScript = Join-Path $repositoryRoot 'scripts\Uninstall-CodexOpenRouter.ps1'
     & $uninstallScript `
         -CodexHome $installCodexHome `
+        -ProfilePath $installProfile `
         -KeepCurrentProvider | Out-Null
     $uninstalledProfile = [IO.File]::ReadAllText($installProfile)
     Assert-True `
@@ -268,7 +275,9 @@ try {
         -Condition $uninstalledProfile.Contains('Existing-Helper') `
         -Message 'Uninstaller preserves existing profile'
 
-    Write-Host "All tests passed: $($scripts.Count) PowerShell files parsed; catalog, config, install, idempotence, privacy, and uninstall checks succeeded."
+    & (Join-Path $PSScriptRoot 'Security-Tests.ps1')
+
+    Write-Host "All tests passed: $($scripts.Count) PowerShell files parsed; catalog, config, security, install, restore, rollback, privacy, and uninstall checks succeeded."
 }
 finally {
     Remove-Module CodexOpenRouter -Force -ErrorAction SilentlyContinue
