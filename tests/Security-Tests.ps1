@@ -1068,10 +1068,8 @@ try {
             -Actual $copiedAcl.GetOwner(
                 [Security.Principal.SecurityIdentifier]
             ).Value `
-            -Expected $aclTemplateProbe.GetOwner(
-                [Security.Principal.SecurityIdentifier]
-            ).Value `
-            -Message 'new backup copy preserves safe staging owner SID'
+            -Expected $currentSid.Value `
+            -Message 'new backup copy owner is the current process SID'
         Assert-SecurityEqual `
             -Actual $copiedAcl.GetGroup(
                 [Security.Principal.SecurityIdentifier]

@@ -623,8 +623,23 @@ function Write-ToolkitBytesAtomic {
                 -ErrorAction Stop
             $stagingAcl = New-ToolkitPrivateFileAcl `
                 -TemplateAcl $stagingTemplateAcl
+
+            # PowerShell 7.4 / .NET 8 rejects path-based ACL writes once the
+            # absolute path reaches the legacy MAX_PATH boundary. The file is
+            # still held with FileShare.None, so using the extended-length
+            # spelling preserves the same exclusive staging-file identity.
+            $stagingAclPath = $temporaryPath
+            if ($temporaryPath.Length -ge 260 -and
+                -not $temporaryPath.StartsWith('\\?\')) {
+                if ($temporaryPath.StartsWith('\\')) {
+                    $stagingAclPath = '\\?\UNC\' + $temporaryPath.Substring(2)
+                }
+                else {
+                    $stagingAclPath = '\\?\' + $temporaryPath
+                }
+            }
             Set-Acl `
-                -LiteralPath $temporaryPath `
+                -LiteralPath $stagingAclPath `
                 -AclObject $stagingAcl `
                 -ErrorAction Stop
             $verifiedStagingAcl = Get-Acl `
