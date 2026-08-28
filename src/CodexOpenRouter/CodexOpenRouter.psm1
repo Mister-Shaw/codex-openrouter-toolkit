@@ -2,8 +2,10 @@ Set-StrictMode -Version Latest
 
 $script:MaximumConfigBytes = 5MB
 $script:MaximumCatalogBytes = 50MB
+$script:MaximumProxyStateBytes = 16KB
 $script:ManagedBlockBegin = '# BEGIN CodexOpenRouter managed provider'
 $script:ManagedBlockEnd = '# END CodexOpenRouter managed provider'
+$script:ProxyHeaderName = 'x-cxor-proxy-token'
 $script:EmptyInstructions = ''
 $script:FeaturedModels = @(
     [pscustomobject]@{ Slug = '~openai/gpt-latest'; DisplayName = 'GPT Latest' }
@@ -48,7 +50,24 @@ function Get-CxPaths {
         CodexHome = $codexHome
         ConfigPath = Join-Path $codexHome 'config.toml'
         CatalogPath = Join-Path $codexHome 'openrouter-model-catalog.json'
+        ProxyStatePath = Join-Path $codexHome 'openrouter-cache-proxy.json'
     }
+}
+
+function Test-CxProxyBaseUrl {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    try { $uri = [Uri]$Value }
+    catch { return $false }
+    return $uri.IsAbsoluteUri -and
+        $uri.Scheme -ceq 'http' -and
+        $uri.Host -ceq '127.0.0.1' -and
+        $uri.Port -ge 1024 -and $uri.Port -le 65535 -and
+        $uri.AbsolutePath -ceq '/api/v1' -and
+        [string]::IsNullOrEmpty($uri.Query) -and
+        [string]::IsNullOrEmpty($uri.Fragment) -and
+        [string]::IsNullOrEmpty($uri.UserInfo)
 }
 
 function ConvertTo-CxTomlString {
@@ -201,13 +220,9 @@ function New-CxTomlCodeMask {
 }
 
 function Get-CxAuthPowerShell {
-    $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
-    if ([string]::IsNullOrWhiteSpace($systemDirectory)) {
-        throw '无法确定 Windows 系统目录。'
-    }
-    $path = Join-Path $systemDirectory 'WindowsPowerShell\v1.0\powershell.exe'
+    $path = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw '找不到 Windows PowerShell，无法读取 OpenRouter 密钥。'
+        throw '找不到当前 PowerShell 7，无法读取 OpenRouter 密钥。'
     }
     return [IO.Path]::GetFullPath($path)
 }
@@ -215,31 +230,80 @@ function Get-CxAuthPowerShell {
 function New-CxProviderBlock {
     param(
         [Parameter(Mandatory)][string]$AuthCommand,
+        [string]$ProxyBaseUrl,
+        [string]$ProxyToken,
+        [string]$ProxyStatePath,
+        [switch]$Direct,
         [switch]$ReadProcessEnvironment
     )
 
-    $tokenCommand = if ($ReadProcessEnvironment) {
+    if (-not $Direct -and
+        (-not (Test-CxProxyBaseUrl $ProxyBaseUrl) -or
+         $ProxyToken -notmatch '\A[A-F0-9]{64}\z')) {
+        throw 'OpenRouter provider 缺少有效的本地缓存代理。'
+    }
+    if (-not $Direct -and
+        ([string]::IsNullOrWhiteSpace($ProxyStatePath) -or
+         -not [IO.Path]::IsPathFullyQualified($ProxyStatePath))) {
+        throw 'OpenRouter provider 缺少有效的缓存代理状态路径。'
+    }
+
+    $tokenCommand = if ($Direct -and $ReadProcessEnvironment) {
         '[Console]::Out.Write($env:OPENROUTER_API_KEY)'
     }
-    else {
+    elseif ($Direct) {
         "[Console]::Out.Write([Environment]::GetEnvironmentVariable('OPENROUTER_API_KEY',[EnvironmentVariableTarget]::User))"
+    }
+    else {
+        $moduleValue = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($PSCommandPath))
+        )
+        $stateValue = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($ProxyStatePath))
+        )
+        $proxyUri = [Uri]$ProxyBaseUrl
+        @(
+            "`$d=[Text.Encoding]::UTF8"
+            "`$m=`$d.GetString([Convert]::FromBase64String('$moduleValue'))"
+            "`$s=`$d.GetString([Convert]::FromBase64String('$stateValue'))"
+            "`$x=Import-Module -Name `$m -Force -PassThru"
+            "& `$x { param(`$p,`$q,`$t) [void](Ensure-CxOpenRouterProxy -StatePath `$p -Port `$q -Token `$t); `$k=[Environment]::GetEnvironmentVariable('OPENROUTER_API_KEY',[EnvironmentVariableTarget]::User); if (-not (Test-CxApiKey `$k)) { throw 'OpenRouter API Key 无效。' }; [Console]::Out.Write(`$k) } `$s $($proxyUri.Port) '$ProxyToken'"
+        ) -join ';'
     }
     $args = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $tokenCommand) |
         ForEach-Object { ConvertTo-CxTomlString $_ }
-    return @(
+    $providerLines = [Collections.Generic.List[string]]::new()
+    foreach ($line in @(
         $script:ManagedBlockBegin
         '[model_providers.openrouter]'
         'name = "OpenRouter"'
-        'base_url = "https://openrouter.ai/api/v1"'
+        $(if ($Direct) {
+                'base_url = "https://openrouter.ai/api/v1"'
+            }
+            else {
+                "base_url = $(ConvertTo-CxTomlString $ProxyBaseUrl)"
+        })
         'wire_api = "responses"'
+        'supports_websockets = false'
+    )) { $providerLines.Add($line) }
+    if (-not $Direct) {
+        $providerLines.Add('')
+        $providerLines.Add('[model_providers.openrouter.http_headers]')
+        $providerLines.Add(
+            "$(ConvertTo-CxTomlString $script:ProxyHeaderName) = " +
+            (ConvertTo-CxTomlString $ProxyToken)
+        )
+    }
+    foreach ($line in @(
         ''
         '[model_providers.openrouter.auth]'
         "command = $(ConvertTo-CxTomlString $AuthCommand)"
         "args = [$($args -join ', ')]"
-        'timeout_ms = 5000'
+        'timeout_ms = 15000'
         'refresh_interval_ms = 0'
         $script:ManagedBlockEnd
-    ) -join "`r`n"
+    )) { $providerLines.Add($line) }
+    return $providerLines -join "`r`n"
 }
 
 function Update-CxConfigContent {
@@ -248,14 +312,21 @@ function Update-CxConfigContent {
         [Parameter(Mandatory)][ValidateSet('Default', 'OpenRouter')][string]$Mode,
         [string]$CatalogPath,
         [string]$AuthCommand,
+        [string]$ProxyBaseUrl,
+        [string]$ProxyToken,
+        [string]$ProxyStatePath,
         [string]$Model = '~openai/gpt-latest'
     )
 
     if ($Mode -eq 'OpenRouter' -and
         ([string]::IsNullOrWhiteSpace($CatalogPath) -or
          [string]::IsNullOrWhiteSpace($AuthCommand) -or
+         -not (Test-CxProxyBaseUrl $ProxyBaseUrl) -or
+         $ProxyToken -notmatch '\A[A-F0-9]{64}\z' -or
+         [string]::IsNullOrWhiteSpace($ProxyStatePath) -or
+         -not [IO.Path]::IsPathFullyQualified($ProxyStatePath) -or
          $Model -notmatch '^[^\s\x00-\x1F]{1,256}$')) {
-        throw 'OpenRouter 配置缺少有效的模型、目录或认证命令。'
+        throw 'OpenRouter 配置缺少有效的模型、目录、认证命令或缓存代理。'
     }
 
     $mask = New-CxTomlCodeMask $Content
@@ -339,7 +410,9 @@ function Update-CxConfigContent {
     }
     if (-not [string]::IsNullOrWhiteSpace($preserved)) { $blocks.Add($preserved) }
     if ($Mode -eq 'OpenRouter') {
-        $blocks.Add((New-CxProviderBlock -AuthCommand $AuthCommand))
+        $blocks.Add((New-CxProviderBlock -AuthCommand $AuthCommand `
+                -ProxyBaseUrl $ProxyBaseUrl -ProxyToken $ProxyToken `
+                -ProxyStatePath $ProxyStatePath))
     }
     if ($blocks.Count -eq 0) { return '' }
     return ($blocks -join "`r`n`r`n") + "`r`n"
@@ -426,6 +499,9 @@ function Get-CxConfigChange {
         [Parameter(Mandatory)][ValidateSet('Default', 'OpenRouter')][string]$Mode,
         [string]$CatalogPath,
         [string]$AuthCommand,
+        [string]$ProxyBaseUrl,
+        [string]$ProxyToken,
+        [string]$ProxyStatePath,
         [string]$Model = '~openai/gpt-latest'
     )
 
@@ -440,7 +516,9 @@ function Get-CxConfigChange {
         OriginalFingerprint = $fingerprintAfter
         OriginalContent = $content
         Content = Update-CxConfigContent -Content $content -Mode $Mode `
-            -CatalogPath $CatalogPath -AuthCommand $AuthCommand -Model $Model
+            -CatalogPath $CatalogPath -AuthCommand $AuthCommand `
+            -ProxyBaseUrl $ProxyBaseUrl -ProxyToken $ProxyToken `
+            -ProxyStatePath $ProxyStatePath -Model $Model
     }
 }
 
@@ -458,6 +536,703 @@ function Commit-CxConfigChange {
     if ($current -cne [string]$Change.Content) {
         Write-CxTextFileAtomic -Path $Change.Path -Content ([string]$Change.Content)
     }
+}
+
+function Initialize-CxProxyType {
+    if ('CodexOpenRouter.OpenRouterCacheProxyV1' -as [type]) { return }
+
+    $source = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CodexOpenRouter
+{
+    public static class OpenRouterCacheProxyV1
+    {
+        private const int MaximumRequestBytes = 64 * 1024 * 1024;
+        private const string TokenHeader = "x-cxor-proxy-token";
+
+        private static readonly HashSet<string> HopByHopHeaders =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Connection",
+                "Content-Length",
+                "Host",
+                "Keep-Alive",
+                "Proxy-Authenticate",
+                "Proxy-Authorization",
+                "TE",
+                "Trailer",
+                "Transfer-Encoding",
+                "Upgrade"
+            };
+
+        public static string RewriteRequestJson(string json)
+        {
+            if (json == null) throw new ArgumentNullException(nameof(json));
+            byte[] original = new UTF8Encoding(false, true).GetBytes(json);
+            byte[] rewritten = RewriteRequestBody(original);
+            return new UTF8Encoding(false, true).GetString(rewritten);
+        }
+
+        public static byte[] RewriteRequestBody(byte[] body)
+        {
+            if (body == null) throw new ArgumentNullException(nameof(body));
+            string json = new UTF8Encoding(false, true).GetString(body);
+            JsonNode root = JsonNode.Parse(
+                json,
+                null,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 128
+                });
+            JsonObject request = root as JsonObject;
+            if (request == null)
+                throw new JsonException("The Responses request must be a JSON object.");
+
+            JsonNode modelNode;
+            if (!request.TryGetPropertyValue("model", out modelNode) || modelNode == null)
+                return body;
+
+            string model;
+            try { model = modelNode.GetValue<string>(); }
+            catch (InvalidOperationException) { return body; }
+
+            if (!IsClaudeModel(model) || request.ContainsKey("cache_control"))
+                return body;
+
+            request.Add(
+                "cache_control",
+                new JsonObject { ["type"] = "ephemeral" });
+            return new UTF8Encoding(false).GetBytes(
+                root.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+        }
+
+        public static async Task RunAsync(int port, string token)
+        {
+            if (port < 1024 || port > 65535)
+                throw new ArgumentOutOfRangeException(nameof(port));
+            if (string.IsNullOrWhiteSpace(token))
+                throw new ArgumentException("Proxy token is required.", nameof(token));
+
+            using (var server = new ProxyServer(port, token))
+            {
+                await server.RunAsync().ConfigureAwait(false);
+            }
+        }
+
+        private static bool IsClaudeModel(string model)
+        {
+            if (string.IsNullOrWhiteSpace(model)) return false;
+            return model.StartsWith("anthropic/claude-", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("~anthropic/claude-", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private sealed class ProxyServer : IDisposable
+        {
+            private readonly HttpListener listener;
+            private readonly HttpClient client;
+            private readonly string token;
+
+            internal ProxyServer(int port, string token)
+            {
+                this.token = token;
+                listener = new HttpListener();
+                listener.Prefixes.Add("http://127.0.0.1:" + port + "/");
+
+                var handler = new HttpClientHandler
+                {
+                    AllowAutoRedirect = false,
+                    AutomaticDecompression = DecompressionMethods.None,
+                    UseCookies = false
+                };
+                client = new HttpClient(handler)
+                {
+                    Timeout = Timeout.InfiniteTimeSpan
+                };
+            }
+
+            internal async Task RunAsync()
+            {
+                listener.Start();
+                while (listener.IsListening)
+                {
+                    HttpListenerContext context = await listener.GetContextAsync()
+                        .ConfigureAwait(false);
+                    _ = HandleSafeAsync(context);
+                }
+            }
+
+            private async Task HandleSafeAsync(HttpListenerContext context)
+            {
+                try
+                {
+                    await HandleAsync(context).ConfigureAwait(false);
+                }
+                catch (JsonException)
+                {
+                    await WriteErrorAsync(context.Response, 400, "Invalid JSON request.")
+                        .ConfigureAwait(false);
+                }
+                catch (DecoderFallbackException)
+                {
+                    await WriteErrorAsync(context.Response, 400, "Request body must be UTF-8.")
+                        .ConfigureAwait(false);
+                }
+                catch (RequestTooLargeException)
+                {
+                    await WriteErrorAsync(context.Response, 413, "Request body is too large.")
+                        .ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    await WriteErrorAsync(context.Response, 502, "OpenRouter request failed.")
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    try { context.Response.Close(); } catch { }
+                }
+            }
+
+            private async Task HandleAsync(HttpListenerContext context)
+            {
+                HttpListenerRequest incoming = context.Request;
+                HttpListenerResponse outgoing = context.Response;
+
+                if (!TokenMatches(incoming.Headers[TokenHeader], token))
+                {
+                    await WriteErrorAsync(outgoing, 403, "Forbidden.").ConfigureAwait(false);
+                    return;
+                }
+
+                string path = incoming.Url == null ? string.Empty : incoming.Url.AbsolutePath;
+                if (string.Equals(path, "/__cxor/health", StringComparison.Ordinal) &&
+                    string.Equals(incoming.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    byte[] health = Encoding.UTF8.GetBytes(
+                        "{\"status\":\"ok\",\"schema\":1,\"pid\":" +
+                        Environment.ProcessId.ToString() + "}");
+                    outgoing.StatusCode = 200;
+                    outgoing.ContentType = "application/json; charset=utf-8";
+                    outgoing.ContentLength64 = health.Length;
+                    await outgoing.OutputStream.WriteAsync(health, 0, health.Length)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                if (!string.Equals(path, "/api/v1/responses", StringComparison.Ordinal) ||
+                    !string.Equals(incoming.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteErrorAsync(outgoing, 404, "Endpoint not found.")
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                if (incoming.ContentType == null ||
+                    !incoming.ContentType.StartsWith(
+                        "application/json",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteErrorAsync(outgoing, 415, "Content-Type must be application/json.")
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                byte[] requestBody = await ReadBodyAsync(incoming).ConfigureAwait(false);
+                byte[] upstreamBody = RewriteRequestBody(requestBody);
+                string query = incoming.Url == null ? string.Empty : incoming.Url.Query;
+                var upstreamUri = new Uri(
+                    "https://openrouter.ai/api/v1/responses" + query,
+                    UriKind.Absolute);
+
+                using (var upstreamRequest = new HttpRequestMessage(HttpMethod.Post, upstreamUri))
+                using (var content = new ByteArrayContent(upstreamBody))
+                using (var cancellation = new CancellationTokenSource())
+                {
+                    upstreamRequest.Content = content;
+                    CopyRequestHeaders(incoming, upstreamRequest);
+                    upstreamRequest.Headers.Remove("Accept-Encoding");
+                    upstreamRequest.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
+                    content.Headers.Remove("Content-Type");
+                    content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
+
+                    using (HttpResponseMessage upstream = await client.SendAsync(
+                        upstreamRequest,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        cancellation.Token).ConfigureAwait(false))
+                    {
+                        outgoing.StatusCode = (int)upstream.StatusCode;
+                        outgoing.SendChunked = true;
+                        outgoing.KeepAlive = false;
+                        CopyResponseHeaders(upstream, outgoing);
+
+                        using (Stream source = await upstream.Content.ReadAsStreamAsync()
+                            .ConfigureAwait(false))
+                        {
+                            byte[] buffer = new byte[16384];
+                            try
+                            {
+                                while (true)
+                                {
+                                    int read = await source.ReadAsync(buffer, 0, buffer.Length)
+                                        .ConfigureAwait(false);
+                                    if (read == 0) break;
+                                    await outgoing.OutputStream.WriteAsync(buffer, 0, read)
+                                        .ConfigureAwait(false);
+                                    await outgoing.OutputStream.FlushAsync().ConfigureAwait(false);
+                                }
+                            }
+                            catch
+                            {
+                                cancellation.Cancel();
+                                throw;
+                            }
+                        }
+                    }
+                }
+            }
+
+            private static async Task<byte[]> ReadBodyAsync(HttpListenerRequest request)
+            {
+                if (request.ContentLength64 > MaximumRequestBytes)
+                    throw new RequestTooLargeException();
+
+                using (var memory = new MemoryStream())
+                {
+                    byte[] buffer = new byte[16384];
+                    int total = 0;
+                    while (true)
+                    {
+                        int read = await request.InputStream.ReadAsync(buffer, 0, buffer.Length)
+                            .ConfigureAwait(false);
+                        if (read == 0) break;
+                        total += read;
+                        if (total > MaximumRequestBytes)
+                            throw new RequestTooLargeException();
+                        memory.Write(buffer, 0, read);
+                    }
+                    return memory.ToArray();
+                }
+            }
+
+            private static void CopyRequestHeaders(
+                HttpListenerRequest incoming,
+                HttpRequestMessage upstream)
+            {
+                foreach (string name in incoming.Headers.AllKeys)
+                {
+                    if (string.IsNullOrEmpty(name) ||
+                        HopByHopHeaders.Contains(name) ||
+                        string.Equals(name, TokenHeader, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "Accept-Encoding", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string[] values = incoming.Headers.GetValues(name);
+                    if (values == null) continue;
+                    if (!upstream.Headers.TryAddWithoutValidation(name, values))
+                        upstream.Content.Headers.TryAddWithoutValidation(name, values);
+                }
+            }
+
+            private static void CopyResponseHeaders(
+                HttpResponseMessage upstream,
+                HttpListenerResponse outgoing)
+            {
+                foreach (var header in upstream.Headers)
+                    CopyResponseHeader(header.Key, header.Value, outgoing);
+                foreach (var header in upstream.Content.Headers)
+                    CopyResponseHeader(header.Key, header.Value, outgoing);
+            }
+
+            private static void CopyResponseHeader(
+                string name,
+                IEnumerable<string> values,
+                HttpListenerResponse outgoing)
+            {
+                if (HopByHopHeaders.Contains(name)) return;
+                if (string.Equals(name, "Content-Type", StringComparison.OrdinalIgnoreCase))
+                {
+                    outgoing.ContentType = string.Join(", ", values);
+                    return;
+                }
+                try { outgoing.Headers[name] = string.Join(", ", values); }
+                catch (ArgumentException) { }
+                catch (InvalidOperationException) { }
+            }
+
+            private static bool TokenMatches(string supplied, string expected)
+            {
+                if (supplied == null || expected == null) return false;
+                byte[] left = Encoding.UTF8.GetBytes(supplied);
+                byte[] right = Encoding.UTF8.GetBytes(expected);
+                return left.Length == right.Length &&
+                    CryptographicOperations.FixedTimeEquals(left, right);
+            }
+
+            private static async Task WriteErrorAsync(
+                HttpListenerResponse response,
+                int statusCode,
+                string message)
+            {
+                try
+                {
+                    if (response.OutputStream == null) return;
+                    byte[] body = Encoding.UTF8.GetBytes(
+                        "{\"error\":\"" + message.Replace("\"", "") + "\"}");
+                    response.StatusCode = statusCode;
+                    response.ContentType = "application/json; charset=utf-8";
+                    response.ContentLength64 = body.Length;
+                    await response.OutputStream.WriteAsync(body, 0, body.Length)
+                        .ConfigureAwait(false);
+                }
+                catch { }
+            }
+
+            public void Dispose()
+            {
+                try { if (listener.IsListening) listener.Stop(); } catch { }
+                listener.Close();
+                client.Dispose();
+            }
+
+            private sealed class RequestTooLargeException : Exception { }
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Start-CxProxyServer {
+    param([Parameter(Mandatory)][ValidateRange(1024, 65535)][int]$Port)
+
+    $token = [Environment]::GetEnvironmentVariable('CXOR_PROXY_TOKEN', 'Process')
+    if ($token -notmatch '\A[A-F0-9]{64}\z') {
+        throw '缓存代理缺少有效的启动令牌。'
+    }
+    Initialize-CxProxyType
+    [CodexOpenRouter.OpenRouterCacheProxyV1]::RunAsync($Port, $token).
+        GetAwaiter().GetResult()
+}
+
+function Get-CxProxyPowerShellPath {
+    $path = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw '找不到当前 PowerShell 7 可执行文件，无法启动缓存代理。'
+    }
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Get-CxFreeLoopbackPort {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally { $listener.Stop() }
+}
+
+function Get-CxProxyState {
+    param([Parameter(Mandatory)][string]$StatePath)
+
+    $content = Read-CxTextFile -Path $StatePath `
+        -MaximumBytes $script:MaximumProxyStateBytes
+    if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+    try { $data = $content | ConvertFrom-Json -ErrorAction Stop }
+    catch { return $null }
+
+    foreach ($name in @('schema', 'pid', 'port', 'token', 'started_utc', 'module_path')) {
+        if (-not $data.PSObject.Properties[$name]) { return $null }
+    }
+    try {
+        $schema = [int]$data.schema
+        $processId = [int]$data.pid
+        $port = [int]$data.port
+    }
+    catch { return $null }
+    $started = [DateTimeOffset]::MinValue
+    if ($schema -ne 1 -or
+        $processId -le 0 -or
+        $port -lt 1024 -or $port -gt 65535 -or
+        [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
+        -not [DateTimeOffset]::TryParse(
+            [string]$data.started_utc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$started
+        ) -or
+        [string]::IsNullOrWhiteSpace([string]$data.module_path)) {
+        return $null
+    }
+    try { $modulePath = [IO.Path]::GetFullPath([string]$data.module_path) }
+    catch { return $null }
+
+    return [pscustomobject]@{
+        Schema = 1
+        ProcessId = $processId
+        Port = $port
+        Token = [string]$data.token
+        StartedUtc = $started.ToUniversalTime()
+        ModulePath = $modulePath
+        BaseUrl = "http://127.0.0.1:$port/api/v1"
+    }
+}
+
+function Test-CxProxyProcess {
+    param([Parameter(Mandatory)][object]$State)
+
+    try {
+        $process = Get-Process -Id $State.ProcessId -ErrorAction Stop
+        $expectedPath = Get-CxProxyPowerShellPath
+        $actualPath = [IO.Path]::GetFullPath($process.Path)
+        $started = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+        return [string]::Equals(
+            $actualPath,
+            $expectedPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and [Math]::Abs(($started - $State.StartedUtc).TotalSeconds) -lt 1
+    }
+    catch { return $false }
+}
+
+function Test-CxProxyHealth {
+    param([Parameter(Mandatory)][object]$State)
+
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromMilliseconds(750)
+    $request = [Net.Http.HttpRequestMessage]::new(
+        [Net.Http.HttpMethod]::Get,
+        "http://127.0.0.1:$($State.Port)/__cxor/health"
+    )
+    try {
+        [void]$request.Headers.TryAddWithoutValidation(
+            $script:ProxyHeaderName,
+            [string]$State.Token
+        )
+        $response = $client.Send($request)
+        try {
+            if (-not $response.IsSuccessStatusCode) { return $false }
+            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ([Text.Encoding]::UTF8.GetByteCount($body) -gt 1024) { return $false }
+            $health = $body | ConvertFrom-Json -ErrorAction Stop
+            return [string]$health.status -ceq 'ok' -and
+                [int]$health.schema -eq 1 -and
+                [int]$health.pid -eq [int]$State.ProcessId
+        }
+        finally { $response.Dispose() }
+    }
+    catch { return $false }
+    finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Remove-CxProxyStateFile {
+    param([Parameter(Mandatory)][string]$StatePath)
+
+    if (-not (Test-Path -LiteralPath $StatePath)) { return }
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+        throw "缓存代理状态路径必须指向普通文件：$StatePath"
+    }
+    $item = Get-Item -LiteralPath $StatePath -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.Length -gt $script:MaximumProxyStateBytes) {
+        throw "缓存代理状态文件无法安全删除：$StatePath"
+    }
+    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+}
+
+function Start-CxOpenRouterProxy {
+    param(
+        [Parameter(Mandatory)][string]$StatePath,
+        [Parameter(Mandatory)][ValidateRange(1024, 65535)][int]$Port,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-F0-9]{64}\z')][string]$Token
+    )
+
+    $modulePath = [IO.Path]::GetFullPath($PSCommandPath)
+    if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+        throw '缓存代理无法定位当前模块。'
+    }
+    $command = @'
+$ErrorActionPreference = 'Stop'
+$module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
+& $module { Start-CxProxyServer -Port ([int]$env:CXOR_PROXY_PORT) }
+'@
+    $encodedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($command)
+    )
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Get-CxProxyPowerShellPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @(
+            '-NoLogo', '-NoProfile', '-NonInteractive',
+            '-EncodedCommand', $encodedCommand
+        )) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $startInfo.Environment['CXOR_PROXY_MODULE_PATH'] = $modulePath
+    $startInfo.Environment['CXOR_PROXY_PORT'] = [string]$Port
+    $startInfo.Environment['CXOR_PROXY_TOKEN'] = $Token
+    [void]$startInfo.Environment.Remove('OPENROUTER_API_KEY')
+
+    $process = [Diagnostics.Process]::new()
+    try {
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw '缓存代理进程未能启动。' }
+        $startedUtc = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+        $probeState = [pscustomobject]@{
+            ProcessId = $process.Id
+            Port = $Port
+            Token = $Token
+            StartedUtc = $startedUtc
+        }
+        $healthy = $false
+        foreach ($attempt in 1..50) {
+            if ($process.HasExited) { break }
+            if (Test-CxProxyHealth $probeState) { $healthy = $true; break }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $healthy) {
+            $diagnostic = if ($process.HasExited) {
+                ($process.StandardError.ReadToEnd() + ' ' +
+                    $process.StandardOutput.ReadToEnd()).Trim()
+            }
+            else { '健康检查超时。' }
+            if (-not $process.HasExited) {
+                try { $process.Kill($true) } catch { }
+                [void]$process.WaitForExit(2000)
+            }
+            throw "缓存代理启动失败：$diagnostic"
+        }
+
+        $stateContent = [ordered]@{
+            schema = 1
+            pid = $process.Id
+            port = $Port
+            token = $Token
+            started_utc = $startedUtc.ToString('O')
+            module_path = $modulePath
+        } | ConvertTo-Json -Compress
+        try {
+            Write-CxTextFileAtomic -Path $StatePath -Content $stateContent
+            $state = Get-CxProxyState -StatePath $StatePath
+            if ($null -eq $state) { throw '缓存代理状态写入后无法验证。' }
+        }
+        catch {
+            try { $process.Kill($true) } catch { }
+            [void]$process.WaitForExit(2000)
+            try { Remove-CxProxyStateFile -StatePath $StatePath } catch { }
+            throw
+        }
+        $state | Add-Member -NotePropertyName Created -NotePropertyValue $true
+        return $state
+    }
+    finally { $process.Dispose() }
+}
+
+function Ensure-CxOpenRouterProxy {
+    param(
+        [Parameter(Mandatory)][string]$StatePath,
+        [ValidateRange(0, 65535)][int]$Port = 0,
+        [string]$Token
+    )
+
+    $mutex = Enter-CxMutex $StatePath
+    try {
+        $stateFileExists = Test-Path -LiteralPath $StatePath
+        $state = Get-CxProxyState -StatePath $StatePath
+        $processMatches = $null -ne $state -and (Test-CxProxyProcess $state)
+        if ($processMatches -and (Test-CxProxyHealth $state)) {
+            if (($Port -eq 0 -or $state.Port -eq $Port) -and
+                ([string]::IsNullOrWhiteSpace($Token) -or $state.Token -ceq $Token)) {
+                $state | Add-Member -NotePropertyName Created -NotePropertyValue $false
+                return $state
+            }
+            throw '缓存代理正在运行，但与当前 Codex 配置不一致；请重新运行 cxor。'
+        }
+        if ($processMatches) {
+            $staleProcess = Get-Process -Id $state.ProcessId -ErrorAction Stop
+            try {
+                Stop-Process -Id $state.ProcessId -Force -ErrorAction Stop
+                [void]$staleProcess.WaitForExit(3000)
+            }
+            catch { throw '缓存代理失去响应，且无法安全结束原进程。' }
+            finally { $staleProcess.Dispose() }
+        }
+        if ($stateFileExists) { Remove-CxProxyStateFile -StatePath $StatePath }
+
+        $fixedPort = $Port -ne 0
+        if (-not $fixedPort) { $Port = Get-CxFreeLoopbackPort }
+        if ([string]::IsNullOrWhiteSpace($Token)) {
+            $Token = [Convert]::ToHexString(
+                [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+            )
+        }
+        $attempts = if ($fixedPort) { 1 } else { 5 }
+        for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            try {
+                return Start-CxOpenRouterProxy -StatePath $StatePath `
+                    -Port $Port -Token $Token
+            }
+            catch {
+                if ($attempt -eq $attempts) { throw }
+                $Port = Get-CxFreeLoopbackPort
+            }
+        }
+    }
+    finally { Exit-CxMutex $mutex }
+}
+
+function Stop-CxOpenRouterProxy {
+    param([Parameter(Mandatory)][string]$StatePath)
+
+    $mutex = Enter-CxMutex $StatePath
+    try {
+        $state = Get-CxProxyState -StatePath $StatePath
+        if ($null -eq $state) {
+            if (Test-Path -LiteralPath $StatePath) {
+                Remove-CxProxyStateFile -StatePath $StatePath
+            }
+            return $false
+        }
+        if (-not (Test-CxProxyProcess $state)) {
+            Remove-CxProxyStateFile -StatePath $StatePath
+            return $false
+        }
+        $process = Get-Process -Id $state.ProcessId -ErrorAction Stop
+        try {
+            Stop-Process -Id $state.ProcessId -Force -ErrorAction Stop
+            [void]$process.WaitForExit(3000)
+        }
+        finally { $process.Dispose() }
+        Remove-CxProxyStateFile -StatePath $StatePath
+        return $true
+    }
+    finally { Exit-CxMutex $mutex }
 }
 
 function Test-CxApiKey {
@@ -934,7 +1709,7 @@ function Sync-CxOpenRouterCatalog {
             [void](New-Item -ItemType Directory -Path $temporaryHome -ErrorAction Stop)
 
             $provider = New-CxProviderBlock -AuthCommand $AuthCommand `
-                -ReadProcessEnvironment
+                -Direct -ReadProcessEnvironment
             $temporaryConfig = @(
                 'model = "~openai/gpt-latest"'
                 'model_provider = "openrouter"'
@@ -1154,27 +1929,44 @@ function Invoke-CxMode {
         }
         $app = Resolve-CxDesktopApp
         $catalogResult = $null
-        if ($Mode -eq 'OpenRouter') {
-            $key = if ($SetKey) { Set-CxUserApiKey } else { Get-CxUserApiKey -Prompt }
-            $authCommand = Get-CxAuthPowerShell
-            $cli = Get-CxCodexCliPath
-            $catalogResult = Sync-CxOpenRouterCatalog -CliPath $cli -ApiKey $key `
-                -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
-                -AllModels:$AllModels
-            if ($catalogResult.UsedPreviousCatalog) {
-                Write-Warning 'OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。'
+        $proxy = $null
+        try {
+            if ($Mode -eq 'OpenRouter') {
+                $key = if ($SetKey) { Set-CxUserApiKey } else { Get-CxUserApiKey -Prompt }
+                $authCommand = Get-CxAuthPowerShell
+                $cli = Get-CxCodexCliPath
+                $catalogResult = Sync-CxOpenRouterCatalog -CliPath $cli -ApiKey $key `
+                    -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
+                    -AllModels:$AllModels
+                if ($catalogResult.UsedPreviousCatalog) {
+                    Write-Warning 'OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。'
+                }
+                $proxy = Ensure-CxOpenRouterProxy -StatePath $paths.ProxyStatePath
+                $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode OpenRouter `
+                    -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
+                    -ProxyBaseUrl $proxy.BaseUrl -ProxyToken $proxy.Token `
+                    -ProxyStatePath $paths.ProxyStatePath `
+                    -Model $catalogResult.DefaultModel
             }
-            $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode OpenRouter `
-                -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
-                -Model $catalogResult.DefaultModel
+            else {
+                $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode Default
+            }
+            $processes = @(Get-CxDesktopProcesses $app)
         }
-        else {
-            $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode Default
+        catch {
+            if ($null -ne $proxy -and $proxy.Created) {
+                try { [void](Stop-CxOpenRouterProxy -StatePath $paths.ProxyStatePath) }
+                catch { }
+            }
+            throw
         }
 
-        $processes = @(Get-CxDesktopProcesses $app)
         try { Stop-CxDesktopApp $processes }
         catch {
+            if ($null -ne $proxy -and $proxy.Created) {
+                try { [void](Stop-CxOpenRouterProxy -StatePath $paths.ProxyStatePath) }
+                catch { }
+            }
             try { Start-CxDesktopApp $app } catch { }
             throw
         }
@@ -1182,10 +1974,20 @@ function Invoke-CxMode {
         try {
             Commit-CxConfigChange $change
             $committed = $true
+            if ($Mode -eq 'Default') {
+                try { [void](Stop-CxOpenRouterProxy -StatePath $paths.ProxyStatePath) }
+                catch {
+                    Write-Warning "默认配置已恢复，但缓存代理清理失败：$($_.Exception.Message)"
+                }
+            }
             Start-CxDesktopApp $app
         }
         catch {
             if (-not $committed) {
+                if ($null -ne $proxy -and $proxy.Created) {
+                    try { [void](Stop-CxOpenRouterProxy -StatePath $paths.ProxyStatePath) }
+                    catch { }
+                }
                 try { Start-CxDesktopApp $app } catch { }
                 throw
             }
@@ -1195,7 +1997,8 @@ function Invoke-CxMode {
         if ($Mode -eq 'OpenRouter') {
             Write-Host (
                 "cxor：已同步 $($catalogResult.ModelCount) 个模型，" +
-                "选择器显示 $($catalogResult.VisibleModelCount) 个模型，并请求打开 OpenRouter Codex。"
+                "选择器显示 $($catalogResult.VisibleModelCount) 个模型，" +
+                "全模型缓存感知代理已就绪，并请求打开 OpenRouter Codex。"
             )
         }
         else { Write-Host 'cx：已请求打开默认 Codex。' }

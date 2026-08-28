@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.7' `
+        -Expected '0.1.8' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -123,6 +123,148 @@ try {
     Assert-True `
         -Condition ($moduleSource.Contains('$startInfo.StandardErrorEncoding = $utf8')) `
         -Message 'CLI stderr decoding is pinned to UTF-8'
+    Assert-True `
+        -Condition ($moduleSource.Contains('HttpCompletionOption.ResponseHeadersRead')) `
+        -Message 'Proxy starts forwarding after upstream response headers arrive'
+    Assert-True `
+        -Condition ($moduleSource.Contains('ReadAsStreamAsync')) `
+        -Message 'Proxy reads the upstream response as a stream'
+    Assert-True `
+        -Condition ($moduleSource.Contains('FlushAsync')) `
+        -Message 'Proxy flushes streamed response chunks'
+    Assert-True `
+        -Condition ($moduleSource.Contains('outgoing.ContentType = string.Join')) `
+        -Message 'Proxy preserves the restricted SSE content-type header'
+
+    $proxyRewrite = & $module {
+        Initialize-CxProxyType
+        $claudeInput = '{"model":"anthropic/claude-opus-5","input":[{"role":"user","content":"hello"}],"prompt_cache_key":"task-123","stream":true}'
+        $tildeInput = '{"model":"~Anthropic/Claude-Opus-Latest","input":"hello"}'
+        $existingInput = '{"model":"anthropic/claude-opus-5","cache_control":{"type":"ephemeral","ttl":"1h"},"input":"hello","prompt_cache_key":"task-existing","stream":true}'
+        $nullInput = '{"model":"anthropic/claude-opus-5","cache_control":null,"input":"hello"}'
+        $passThroughInputs = [ordered]@{
+            OpenAI = ' { "model" : "openai/gpt-5.6-sol", "input" : "\u4f60\u597d", "prompt_cache_key" : "task-openai", "prompt_cache_retention" : "24h", "stream" : true } '
+            Gemini = "{`n  `"model`": `"google/gemini-2.5-pro`",`n  `"input`": `"hello`",`n  `"prompt_cache_key`": `"task-gemini`"`n}"
+            DeepSeek = '{"model":"deepseek/deepseek-chat","input":"hello","prompt_cache_key":"task-deepseek"}'
+            Unknown = '{"model":"meta-llama/llama-3.3-70b-instruct","input":"hello","prompt_cache_key":"task-unknown"}'
+            MissingModel = '{ "input": "hello", "prompt_cache_key": "task-missing" }'
+            NumericModel = '{ "model": 42, "input": "hello", "prompt_cache_key": "task-numeric" }'
+        }
+        $passThrough = foreach ($entry in $passThroughInputs.GetEnumerator()) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes([string]$entry.Value)
+            $rewrittenBytes = [CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestBody(
+                $bytes
+            )
+            [pscustomobject]@{
+                Label = [string]$entry.Key
+                Original = [Convert]::ToBase64String($bytes)
+                Rewritten = [Convert]::ToBase64String($rewrittenBytes)
+                Json = [Text.Encoding]::UTF8.GetString($rewrittenBytes)
+            }
+        }
+        [pscustomobject]@{
+            ClaudeInput = $claudeInput
+            Claude = [CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestJson(
+                $claudeInput
+            )
+            Tilde = [CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestJson(
+                $tildeInput
+            )
+            ExistingInput = $existingInput
+            Existing = [CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestJson(
+                $existingInput
+            )
+            NullInput = $nullInput
+            Null = [CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestJson(
+                $nullInput
+            )
+            PassThrough = @($passThrough)
+        }
+    }
+    $rewrittenClaude = $proxyRewrite.Claude | ConvertFrom-Json
+    $rewrittenTilde = $proxyRewrite.Tilde | ConvertFrom-Json
+    Assert-Equal `
+        -Actual ([string]$rewrittenClaude.cache_control.type) `
+        -Expected 'ephemeral' `
+        -Message 'Claude Responses request receives five-minute prompt caching'
+    Assert-Equal `
+        -Actual ([string]$rewrittenClaude.prompt_cache_key) `
+        -Expected 'task-123' `
+        -Message 'Claude request preserves the Codex prompt cache key'
+    Assert-True `
+        -Condition ($null -eq $rewrittenClaude.PSObject.Properties['session_id']) `
+        -Message 'Proxy does not create a cross-task session id'
+    Assert-Equal `
+        -Actual ([string]$rewrittenClaude.input[0].content) `
+        -Expected 'hello' `
+        -Message 'Claude request preserves input content'
+    Assert-Equal `
+        -Actual ([bool]$rewrittenClaude.stream) `
+        -Expected $true `
+        -Message 'Claude request preserves streaming mode'
+    Assert-Equal `
+        -Actual ([string]$rewrittenTilde.cache_control.type) `
+        -Expected 'ephemeral' `
+        -Message 'Tilde Claude alias receives prompt caching case-insensitively'
+    Assert-Equal `
+        -Actual ([string]$proxyRewrite.Existing) `
+        -Expected ([string]$proxyRewrite.ExistingInput) `
+        -Message 'Existing cache control including TTL is preserved byte-for-byte'
+    Assert-Equal `
+        -Actual ([string]$proxyRewrite.Null) `
+        -Expected ([string]$proxyRewrite.NullInput) `
+        -Message 'Explicit null cache control is preserved byte-for-byte'
+    $rewrittenExisting = $proxyRewrite.Existing | ConvertFrom-Json
+    Assert-Equal `
+        -Actual ([string]$rewrittenExisting.cache_control.ttl) `
+        -Expected '1h' `
+        -Message 'Existing Claude cache TTL remains unchanged'
+    Assert-Equal `
+        -Actual ([string]$rewrittenExisting.prompt_cache_key) `
+        -Expected 'task-existing' `
+        -Message 'Existing Claude cache control preserves the prompt cache key'
+    Assert-Equal `
+        -Actual ([bool]$rewrittenExisting.stream) `
+        -Expected $true `
+        -Message 'Existing Claude cache control preserves streaming mode'
+    foreach ($case in $proxyRewrite.PassThrough) {
+        Assert-Equal `
+            -Actual ([string]$case.Rewritten) `
+            -Expected ([string]$case.Original) `
+            -Message "$($case.Label) request remains byte-for-byte unchanged"
+        $parsed = [string]$case.Json | ConvertFrom-Json
+        Assert-True `
+            -Condition ($null -eq $parsed.PSObject.Properties['cache_control']) `
+            -Message "$($case.Label) receives no incompatible Claude cache control"
+        Assert-True `
+            -Condition ($null -eq $parsed.PSObject.Properties['session_id']) `
+            -Message "$($case.Label) receives no synthetic session id"
+    }
+    $openAiCase = $proxyRewrite.PassThrough |
+        Where-Object Label -CEQ 'OpenAI' |
+        Select-Object -First 1
+    $rewrittenOpenAi = [string]$openAiCase.Json | ConvertFrom-Json
+    Assert-Equal `
+        -Actual ([string]$rewrittenOpenAi.prompt_cache_key) `
+        -Expected 'task-openai' `
+        -Message 'OpenAI automatic caching keeps the Codex prompt cache key'
+    Assert-Equal `
+        -Actual ([string]$rewrittenOpenAi.prompt_cache_retention) `
+        -Expected '24h' `
+        -Message 'OpenAI provider-specific prompt cache settings remain intact'
+    Assert-Equal `
+        -Actual ([bool]$rewrittenOpenAi.stream) `
+        -Expected $true `
+        -Message 'OpenAI automatic caching preserves streaming mode'
+    Assert-ThrowsLike `
+        -Action {
+            & $module {
+                Initialize-CxProxyType
+                [void][CodexOpenRouter.OpenRouterCacheProxyV1]::RewriteRequestJson('{')
+            }
+        } `
+        -Pattern '*' `
+        -Message 'Malformed proxy JSON is rejected'
 
     $requestKey = 'sk-' + 'or-' + ('q' * 24)
     $requestResult = & $module {
@@ -227,6 +369,11 @@ try {
         ([IO.Path]::GetTempPath()) `
         'cx-tests\openrouter-model-catalog.json'
     $authCommand = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    $proxyBaseUrl = 'http://127.0.0.1:43127/api/v1'
+    $proxyToken = 'A' * 64
+    $proxyStatePath = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        'cx-tests\openrouter-cache-proxy.json'
     $tomlInput = @'
 model = "old/default"
 model_reasoning_effort = "high"
@@ -256,19 +403,33 @@ keep_tooling = "yes"
 '@
     $openRouterModel = '~openai/gpt-latest'
     $tomlResult = & $module {
-        param($Content, $CatalogPath, $AuthCommand, $Model)
+        param(
+            $Content,
+            $CatalogPath,
+            $AuthCommand,
+            $Model,
+            $ProxyBaseUrl,
+            $ProxyToken,
+            $ProxyStatePath
+        )
 
         $openRouter = Update-CxConfigContent `
             -Content $Content `
             -Mode OpenRouter `
             -CatalogPath $CatalogPath `
             -AuthCommand $AuthCommand `
+            -ProxyBaseUrl $ProxyBaseUrl `
+            -ProxyToken $ProxyToken `
+            -ProxyStatePath $ProxyStatePath `
             -Model $Model
         $openRouterAgain = Update-CxConfigContent `
             -Content $openRouter `
             -Mode OpenRouter `
             -CatalogPath $CatalogPath `
             -AuthCommand $AuthCommand `
+            -ProxyBaseUrl $ProxyBaseUrl `
+            -ProxyToken $ProxyToken `
+            -ProxyStatePath $ProxyStatePath `
             -Model $Model
         $default = Update-CxConfigContent `
             -Content $openRouter `
@@ -280,7 +441,8 @@ keep_tooling = "yes"
             CatalogLiteral = ConvertTo-CxTomlString `
                 ([IO.Path]::GetFullPath($CatalogPath))
         }
-    } $tomlInput $catalogPath $authCommand $openRouterModel
+    } $tomlInput $catalogPath $authCommand $openRouterModel `
+        $proxyBaseUrl $proxyToken $proxyStatePath
 
     foreach ($needle in @(
             'custom_root = "keep-root"',
@@ -340,9 +502,24 @@ keep_tooling = "yes"
         -Message 'OpenRouter TOML removes the quoted legacy auth table'
     Assert-True `
         -Condition $tomlResult.OpenRouter.Contains(
-            'base_url = "https://openrouter.ai/api/v1"'
+            "base_url = `"$proxyBaseUrl`""
         ) `
-        -Message 'OpenRouter TOML writes the current provider'
+        -Message 'OpenRouter TOML writes the loopback cache proxy'
+    Assert-True `
+        -Condition $tomlResult.OpenRouter.Contains(
+            '[model_providers.openrouter.http_headers]'
+        ) `
+        -Message 'OpenRouter TOML writes the proxy header table'
+    Assert-True `
+        -Condition $tomlResult.OpenRouter.Contains(
+            "`"x-cxor-proxy-token`" = `"$proxyToken`""
+        ) `
+        -Message 'OpenRouter TOML writes the proxy authentication token'
+    Assert-True `
+        -Condition $tomlResult.OpenRouter.Contains(
+            'supports_websockets = false'
+        ) `
+        -Message 'OpenRouter TOML keeps the proxy on SSE transport'
     Assert-True `
         -Condition $tomlResult.OpenRouter.Contains(
             "command = $($tomlStringResult.WindowsPath)"
@@ -985,7 +1162,12 @@ keep_tooling = "yes"
         $script:TestStopCalls = 0
         $script:TestStartCalls = 0
         $script:TestCommitCalls = 0
+        $script:TestProxyEnsureCalls = 0
+        $script:TestProxyStopCalls = 0
         $script:TestSyncShouldFail = $false
+        $script:TestConfigShouldFail = $false
+        $script:TestProcessDiscoveryShouldFail = $false
+        $script:TestProxyCreated = $false
         $script:TestConfigModels = [Collections.Generic.List[string]]::new()
         $script:TestAllModels = [Collections.Generic.List[bool]]::new()
 
@@ -995,6 +1177,7 @@ keep_tooling = "yes"
                 CodexHome = 'C:\cx-test'
                 ConfigPath = 'C:\cx-test\config.toml'
                 CatalogPath = 'C:\cx-test\catalog.json'
+                ProxyStatePath = 'C:\cx-test\openrouter-cache-proxy.json'
             }
         }
         function script:Enter-CxMutex {
@@ -1014,6 +1197,20 @@ keep_tooling = "yes"
         }
         function script:Get-CxAuthPowerShell { return 'C:\cx-test\powershell.exe' }
         function script:Get-CxCodexCliPath { return 'C:\cx-test\codex.exe' }
+        function script:Ensure-CxOpenRouterProxy {
+            param([string]$StatePath)
+            $script:TestProxyEnsureCalls++
+            return [pscustomobject]@{
+                BaseUrl = 'http://127.0.0.1:43127/api/v1'
+                Token = 'A' * 64
+                Created = $script:TestProxyCreated
+            }
+        }
+        function script:Stop-CxOpenRouterProxy {
+            param([string]$StatePath)
+            $script:TestProxyStopCalls++
+            return $true
+        }
         function script:Sync-CxOpenRouterCatalog {
             param(
                 [string]$CliPath,
@@ -1043,10 +1240,16 @@ keep_tooling = "yes"
                 [string]$Mode,
                 [string]$CatalogPath,
                 [string]$AuthCommand,
+                [string]$ProxyBaseUrl,
+                [string]$ProxyToken,
+                [string]$ProxyStatePath,
                 [string]$Model
             )
 
             $script:TestConfigModels.Add($Model)
+            if ($script:TestConfigShouldFail) {
+                throw 'synthetic config preparation failure'
+            }
             return [pscustomobject]@{
                 Path = $Path
                 OriginalFingerprint = '<test>'
@@ -1055,6 +1258,9 @@ keep_tooling = "yes"
         }
         function script:Get-CxDesktopProcesses {
             param($App)
+            if ($script:TestProcessDiscoveryShouldFail) {
+                throw 'synthetic desktop discovery failure'
+            }
             return @()
         }
         function script:Stop-CxDesktopApp {
@@ -1077,6 +1283,7 @@ keep_tooling = "yes"
             Stop = $script:TestStopCalls
             Commit = $script:TestCommitCalls
             Start = $script:TestStartCalls
+            ProxyEnsure = $script:TestProxyEnsureCalls
             Models = @($script:TestConfigModels)
             AllModels = @($script:TestAllModels)
         }
@@ -1091,6 +1298,7 @@ keep_tooling = "yes"
             FinalStop = $script:TestStopCalls
             FinalCommit = $script:TestCommitCalls
             FinalStart = $script:TestStartCalls
+            FinalProxyEnsure = $script:TestProxyEnsureCalls
             FinalModels = @($script:TestConfigModels)
             FinalAllModels = @($script:TestAllModels)
             Failure = $failure
@@ -1112,6 +1320,10 @@ keep_tooling = "yes"
         -Actual $orchestration.AfterTwo.Start `
         -Expected 2 `
         -Message 'Two successful cxor calls start the desktop twice'
+    Assert-Equal `
+        -Actual $orchestration.AfterTwo.ProxyEnsure `
+        -Expected 2 `
+        -Message 'Two successful cxor calls ensure the cache proxy twice'
     Assert-Equal `
         -Actual ($orchestration.AfterTwo.Models -join ',') `
         -Expected '~openai/gpt-latest,~openai/gpt-latest' `
@@ -1137,6 +1349,10 @@ keep_tooling = "yes"
         -Expected 2 `
         -Message 'Synchronization failure does not relaunch the running desktop'
     Assert-Equal `
+        -Actual $orchestration.FinalProxyEnsure `
+        -Expected 2 `
+        -Message 'Synchronization failure does not start the cache proxy'
+    Assert-Equal `
         -Actual ($orchestration.FinalModels -join ',') `
         -Expected '~openai/gpt-latest,~openai/gpt-latest' `
         -Message 'Synchronization failure does not prepare a stale model config'
@@ -1147,6 +1363,54 @@ keep_tooling = "yes"
     Assert-True `
         -Condition ($orchestration.Failure -like '*synchronization failure*') `
         -Message 'Synchronization failure is reported to the caller'
+
+    $preparationCleanup = & $module {
+        $script:TestSyncShouldFail = $false
+        $script:TestProxyCreated = $true
+        $script:TestConfigShouldFail = $true
+        $beforeConfigStop = $script:TestProxyStopCalls
+        $beforeDesktopStop = $script:TestStopCalls
+        $configFailure = $null
+        try { cxor }
+        catch { $configFailure = $_.Exception.Message }
+        $afterConfigStop = $script:TestProxyStopCalls
+
+        $script:TestConfigShouldFail = $false
+        $script:TestProcessDiscoveryShouldFail = $true
+        $processFailure = $null
+        try { cxor }
+        catch { $processFailure = $_.Exception.Message }
+
+        [pscustomobject]@{
+            BeforeConfigProxyStop = $beforeConfigStop
+            AfterConfigProxyStop = $afterConfigStop
+            FinalProxyStop = $script:TestProxyStopCalls
+            BeforeDesktopStop = $beforeDesktopStop
+            FinalDesktopStop = $script:TestStopCalls
+            ConfigFailure = $configFailure
+            ProcessFailure = $processFailure
+        }
+    }
+    Assert-Equal `
+        -Actual ($preparationCleanup.AfterConfigProxyStop -
+            $preparationCleanup.BeforeConfigProxyStop) `
+        -Expected 1 `
+        -Message 'Config preparation failure stops a newly created cache proxy'
+    Assert-Equal `
+        -Actual ($preparationCleanup.FinalProxyStop -
+            $preparationCleanup.AfterConfigProxyStop) `
+        -Expected 1 `
+        -Message 'Desktop discovery failure stops a newly created cache proxy'
+    Assert-Equal `
+        -Actual $preparationCleanup.FinalDesktopStop `
+        -Expected $preparationCleanup.BeforeDesktopStop `
+        -Message 'Preparation failures leave the running desktop untouched'
+    Assert-True `
+        -Condition ($preparationCleanup.ConfigFailure -like '*config preparation failure*') `
+        -Message 'Config preparation failure is reported to the caller'
+    Assert-True `
+        -Condition ($preparationCleanup.ProcessFailure -like '*desktop discovery failure*') `
+        -Message 'Desktop discovery failure is reported to the caller'
 
     Write-Host (
         "All tests passed: $script:AssertionCount assertions; " +

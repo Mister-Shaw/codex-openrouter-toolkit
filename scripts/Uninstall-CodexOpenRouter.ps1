@@ -303,10 +303,15 @@ if (Test-PathEqual -Left $resolvedCodexHome -Right $volumeRoot) {
 }
 $configPath = Join-Path $resolvedCodexHome 'config.toml'
 $catalogPath = Join-Path $resolvedCodexHome 'openrouter-model-catalog.json'
+$proxyStatePath = Join-Path $resolvedCodexHome 'openrouter-cache-proxy.json'
 foreach ($managedFile in @($configPath, $catalogPath)) {
     if (Test-Path -LiteralPath $managedFile) {
         Assert-RegularFile -Path $managedFile -Label '受管 Codex 文件' -MaximumBytes 50MB
     }
+}
+if (Test-Path -LiteralPath $proxyStatePath) {
+    Assert-RegularFile -Path $proxyStatePath `
+        -Label '缓存代理状态文件' -MaximumBytes 16KB
 }
 
 $legacyRoot = Join-Path $resolvedCodexHome 'codex-openrouter-toolkit'
@@ -349,20 +354,20 @@ $sourcePackage = if (Test-Path -LiteralPath $sourceRoot -PathType Container) {
 }
 else { $null }
 if (-not $sourcePackage) {
-    throw '找不到可用于安全清理配置的 CodexOpenRouter 0.1.7 模块。'
+    throw '找不到可用于安全清理配置的 CodexOpenRouter 0.1.8 模块。'
 }
 $sourceData = Import-PowerShellDataFile -LiteralPath $sourcePackage.ManifestPath
 $sourceExports = @($sourceData.FunctionsToExport)
-if ([version]$sourceData.ModuleVersion -ne [version]'0.1.7' -or
+if ([version]$sourceData.ModuleVersion -ne [version]'0.1.8' -or
     $sourceExports.Count -ne 2 -or
     $sourceExports -cnotcontains 'cx' -or
     $sourceExports -cnotcontains 'cxor') {
-    throw '配置清理模块必须是 0.1.7，且只能导出 cx 与 cxor。'
+    throw '配置清理模块必须是 0.1.8，且只能导出 cx 与 cxor。'
 }
 $moduleManifest = $sourcePackage.ManifestPath
 
 if (-not $PSCmdlet.ShouldProcess(
-        "$moduleRoot、$configPath 与 $catalogPath",
+        "$moduleRoot、$configPath、$catalogPath 与 $proxyStatePath",
         '卸载 Codex OpenRouter Toolkit'
     )) {
     return
@@ -394,6 +399,11 @@ try {
         } $plan.Path $plan.Content
     }
     & $module { param($Change) Commit-CxConfigChange $Change } $configChange
+    $proxyStopped = & $module {
+        param($StatePath)
+        Stop-CxOpenRouterProxy -StatePath $StatePath
+    } $proxyStatePath
+    $proxyStateRemoved = -not (Test-Path -LiteralPath $proxyStatePath)
     $catalogRemoved = $false
     if (Test-Path -LiteralPath $catalogPath -PathType Leaf) {
         $catalogHash = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
@@ -518,6 +528,8 @@ try {
         ModuleRemoved = $moduleRemoved
         ConfigCleaned = $configChanged
         CatalogRemoved = $catalogRemoved
+        ProxyStopped = [bool]$proxyStopped
+        ProxyStateRemoved = $proxyStateRemoved
         ProfileMarkersRemoved = $profilePlans.Count
         LegacyInstallRemoved = $legacyRemoved
         ApiKeyRemoved = [bool]$RemoveApiKey

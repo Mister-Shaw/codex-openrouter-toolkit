@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.8 - 2026-08-28
+
+- 新增仅监听 `127.0.0.1` 的缓存感知代理，OpenRouter 模式下所有 Responses API 请求都会经过该代理并发送到固定 HTTPS 上游。
+- Claude 请求缺少 `cache_control` 时注入默认 5 分钟 `ephemeral` 缓存指令；请求已有该属性时完整保留，包括显式 `null`。
+- OpenAI、DeepSeek、Grok、Moonshot、Groq、Z.AI、Gemini、未知模型和缓存行为不兼容的模型保持请求体原样，继续使用各自上游能力。
+- 原样保留 Codex 的 `prompt_cache_key`，供 OpenRouter 用于同一会话的供应商粘性路由。
+- 增加代理状态、健康检查与 command-auth 自愈；状态文件位于 `<CODEX_HOME>\openrouter-cache-proxy.json`，`cx` 和卸载器会停止代理并删除状态。
+- 加固本地代理边界：随机访问令牌、固定时间校验、固定上游、禁用重定向、严格端点与 JSON 检查、有界请求体、响应流式透传，并避免记录密钥和对话内容。
+- 文档补充缓存费用与验证方法；首次请求仍报告完整输入 token，Claude 缓存写入可能增加本轮输入费用，实际命中应查看 `cached_tokens` 与 `cache_write_tokens`。
+
 ## 0.1.7 - 2026-08-28
 
 - 修复中文 Windows 代码页将 Codex CLI 的 UTF-8 stdout 误解码，导致 `instructions_template` 附近 JSON 转义损坏的问题。
