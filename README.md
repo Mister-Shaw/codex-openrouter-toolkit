@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.8`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.9`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -11,7 +11,8 @@
 
 | 命令 | 作用 |
 | --- | --- |
-| `cx` | 移除工具包托管的模型与 OpenRouter 配置，停止本地代理，并请求打开默认 Codex |
+| `cx` | 移除工具包托管的模型与 OpenRouter 配置，保留代理供已打开任务使用，并请求打开默认 Codex |
+| `cx -StopProxy` | 返回默认 Codex，同时立即停止本地代理；已打开的 OpenRouter 任务随后无法继续调用该端口 |
 | `cxor` | 同步 OpenRouter 最新 Codex 兼容目录，启动本地缓存感知代理，默认只显示 Claude 与 OpenAI 精选模型，切换到 OpenRouter，并请求重启桌面端 |
 | `cxor -SetKey` | 通过隐藏输入设置或轮换当前 Windows 用户的 OpenRouter API Key，然后进入 OpenRouter 模式 |
 | `cxor -AllModels` | 临时恢复完整 OpenRouter 模型列表；可与 `-SetKey` 组合 |
@@ -73,7 +74,7 @@ cxor -AllModels
 cx
 ```
 
-`cx` 会从 `config.toml` 移除工具包托管的 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置；随后停止本地缓存感知代理、移除其状态文件，并请求重新打开 Codex Desktop。
+`cx` 会从 `config.toml` 移除工具包托管的 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置，并请求重新打开 Codex Desktop。代理与状态文件默认保留，使已经打开且仍持有原环回地址的 OpenRouter 任务可以完成。需要立即结束代理时运行 `cx -StopProxy`。
 
 需要轮换 Key 时运行：
 
@@ -101,7 +102,9 @@ OpenRouter 模式下，Codex 发往 OpenRouter Responses API 的所有请求都�
 
 本地代理不会建立本地提示内容缓存。每一轮完整请求仍会上传到 OpenRouter；上游命中缓存后复用的是模型已经计算的提示前缀。活动页首轮仍会显示完整输入 token，Claude 建立缓存时还可能产生高于普通输入的缓存写入费用。判断缓存是否生效时，请查看 Responses 用量中的 `usage.input_tokens_details.cached_tokens` 与 `cache_write_tokens`：前者大于 0 表示读取命中，后者大于 0 表示本轮写入缓存。总输入 token 不能单独证明缓存是否命中。
 
-代理状态保存在 `<CODEX_HOME>\openrouter-cache-proxy.json`，默认位置为 `%USERPROFILE%\.codex\openrouter-cache-proxy.json`。状态文件记录进程、环回端口、随机本地访问令牌、启动时间和模块路径，不保存 OpenRouter API Key、提示或响应。电脑重启或代理退出后，OpenRouter provider 的 command-auth 会先校验并按原端口与令牌自愈代理，再读取当前用户的 API Key。运行 `cx` 会停止代理并删除状态文件；卸载器也会执行相同清理。
+代理状态保存在 `<CODEX_HOME>\openrouter-cache-proxy.json`，默认位置为 `%USERPROFILE%\.codex\openrouter-cache-proxy.json`。状态文件记录进程、环回端口、随机本地访问令牌、启动时间和模块路径，不保存 OpenRouter API Key、提示或响应。电脑重启或代理退出后，OpenRouter provider 的 command-auth 会先校验并按原端口与令牌自愈代理，再读取当前用户的 API Key。`cx` 默认保留代理与状态，`cx -StopProxy` 和卸载器会停止代理并删除状态文件。
+
+代理收到上游非成功状态时会保留 HTTP 状态，并把空白或旧式错误正文转换为 Codex 可读取的 `error` 对象。本地转发异常会返回固定阶段码，例如 `send_upstream`、`copy_response_headers` 或 `read_upstream`，同时通过 `x-cxor-error-source` 标明来源。本地阶段诊断不包含 API Key、提示、响应正文、查询串或异常堆栈。
 
 ## 更新与卸载
 
@@ -123,6 +126,7 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 - 遇到 `Content` 为空、CLI JSON 损坏、系统临时目录 PATH alias 警告或持续显示旧目录告警：升级到 `0.1.8`；目录同步修复会固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。
+- 出现 `502 Bad Gateway`：升级到 `0.1.9`，在普通 PowerShell 7 窗口重新运行 `cxor`，再创建新任务。新错误正文会区分 OpenRouter 上游 HTTP 状态与本地代理处理阶段；从 Codex 沙箱内启动的后台代理可能继承受限 TLS 环境。
 - `cached_tokens` 持续为 0：确认连续请求具有相同的长前缀、使用相同模型与稳定的 `prompt_cache_key`，并满足模型的最小可缓存长度和有效期要求。模型或下游不支持缓存时，代理会继续安全转发请求。
 
 ## 数据与安全

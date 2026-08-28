@@ -539,7 +539,7 @@ function Commit-CxConfigChange {
 }
 
 function Initialize-CxProxyType {
-    if ('CodexOpenRouter.OpenRouterCacheProxyV1' -as [type]) { return }
+    if ('CodexOpenRouter.OpenRouterCacheProxyV2' -as [type]) { return }
 
     $source = @'
 using System;
@@ -556,10 +556,13 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter
 {
-    public static class OpenRouterCacheProxyV1
+    public static class OpenRouterCacheProxyV2
     {
         private const int MaximumRequestBytes = 64 * 1024 * 1024;
+        private const int MaximumErrorResponseBytes = 1024 * 1024;
         private const string TokenHeader = "x-cxor-proxy-token";
+        private const string ErrorCodeHeader = "x-cxor-error-code";
+        private const string ErrorSourceHeader = "x-cxor-error-source";
 
         private static readonly HashSet<string> HopByHopHeaders =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -574,6 +577,15 @@ namespace CodexOpenRouter
                 "Trailer",
                 "Transfer-Encoding",
                 "Upgrade"
+            };
+
+        private static readonly HashSet<string> SafeErrorResponseHeaders =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "cf-ray",
+                "Retry-After",
+                "x-openrouter-request-id",
+                "x-request-id"
             };
 
         public static string RewriteRequestJson(string json)
@@ -619,6 +631,52 @@ namespace CodexOpenRouter
                 root.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
         }
 
+        public static string CreateErrorJson(string message, string type, string code)
+        {
+            if (string.IsNullOrWhiteSpace(message)) message = "OpenRouter request failed.";
+            if (string.IsNullOrWhiteSpace(type)) type = "cxor_proxy_error";
+            if (string.IsNullOrWhiteSpace(code)) code = "proxy_error";
+            var error = new JsonObject
+            {
+                ["message"] = message,
+                ["type"] = type,
+                ["code"] = code,
+                ["param"] = null
+            };
+            return new JsonObject { ["error"] = error }.ToJsonString(
+                new JsonSerializerOptions { WriteIndented = false });
+        }
+
+        public static string NormalizeUpstreamErrorJson(string json, int statusCode)
+        {
+            string message = null;
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                try
+                {
+                    JsonObject root = JsonNode.Parse(json) as JsonObject;
+                    JsonNode errorNode;
+                    if (root != null && root.TryGetPropertyValue("error", out errorNode))
+                    {
+                        JsonObject errorObject = errorNode as JsonObject;
+                        string objectMessage = ReadJsonString(errorObject, "message");
+                        if (IsUsableErrorMessage(objectMessage)) return json;
+                        message = ReadJsonString(errorNode);
+                    }
+                    if (string.IsNullOrWhiteSpace(message))
+                        message = ReadJsonString(root, "message");
+                }
+                catch (JsonException) { }
+                catch (InvalidOperationException) { }
+            }
+            if (!IsUsableErrorMessage(message))
+                message = "OpenRouter returned HTTP " + statusCode.ToString() + ".";
+            return CreateErrorJson(
+                message,
+                "cxor_upstream_error",
+                "upstream_http_" + statusCode.ToString());
+        }
+
         public static async Task RunAsync(int port, string token)
         {
             if (port < 1024 || port > 65535)
@@ -628,8 +686,35 @@ namespace CodexOpenRouter
 
             using (var server = new ProxyServer(port, token))
             {
+                await server.VerifyUpstreamAsync().ConfigureAwait(false);
                 await server.RunAsync().ConfigureAwait(false);
             }
+        }
+
+        private static string ReadJsonString(JsonObject value, string propertyName)
+        {
+            if (value == null) return null;
+            JsonNode node;
+            return value.TryGetPropertyValue(propertyName, out node)
+                ? ReadJsonString(node)
+                : null;
+        }
+
+        private static string ReadJsonString(JsonNode value)
+        {
+            if (value == null) return null;
+            try { return value.GetValue<string>(); }
+            catch (InvalidOperationException) { return null; }
+        }
+
+        private static bool IsUsableErrorMessage(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message) || message.Length > 2048) return false;
+            string normalized = message.Trim().TrimEnd('.');
+            return !string.Equals(
+                normalized,
+                "Unknown error",
+                StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsClaudeModel(string model)
@@ -674,31 +759,82 @@ namespace CodexOpenRouter
                 }
             }
 
+            internal async Task VerifyUpstreamAsync()
+            {
+                using (var request = new HttpRequestMessage(
+                    HttpMethod.Get,
+                    "https://openrouter.ai/api/v1/models"))
+                using (var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(8)))
+                {
+                    try
+                    {
+                        using (HttpResponseMessage response = await client.SendAsync(
+                            request,
+                            HttpCompletionOption.ResponseHeadersRead,
+                            cancellation.Token).ConfigureAwait(false))
+                        {
+                            _ = response.StatusCode;
+                        }
+                    }
+                    catch (Exception exception) when (
+                        exception is HttpRequestException ||
+                        exception is TaskCanceledException)
+                    {
+                        throw new InvalidOperationException(
+                            "OpenRouter HTTPS preflight failed (upstream_network_or_tls).",
+                            exception);
+                    }
+                }
+            }
+
             private async Task HandleSafeAsync(HttpListenerContext context)
             {
+                var requestState = new ProxyRequestState();
                 try
                 {
-                    await HandleAsync(context).ConfigureAwait(false);
+                    await HandleAsync(context, requestState).ConfigureAwait(false);
                 }
                 catch (JsonException)
                 {
-                    await WriteErrorAsync(context.Response, 400, "Invalid JSON request.")
+                    await WriteErrorAsync(
+                        context.Response,
+                        400,
+                        "Invalid JSON request.",
+                        "invalid_request_error",
+                        "invalid_json")
                         .ConfigureAwait(false);
                 }
                 catch (DecoderFallbackException)
                 {
-                    await WriteErrorAsync(context.Response, 400, "Request body must be UTF-8.")
+                    await WriteErrorAsync(
+                        context.Response,
+                        400,
+                        "Request body must be UTF-8.",
+                        "invalid_request_error",
+                        "invalid_utf8")
                         .ConfigureAwait(false);
                 }
                 catch (RequestTooLargeException)
                 {
-                    await WriteErrorAsync(context.Response, 413, "Request body is too large.")
+                    await WriteErrorAsync(
+                        context.Response,
+                        413,
+                        "Request body is too large.",
+                        "invalid_request_error",
+                        "request_too_large")
                         .ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
-                    await WriteErrorAsync(context.Response, 502, "OpenRouter request failed.")
-                        .ConfigureAwait(false);
+                    if (!requestState.ResponseStarted)
+                    {
+                        await WriteErrorAsync(
+                            context.Response,
+                            502,
+                            "Local OpenRouter proxy failed at " + requestState.Phase + ".",
+                            "cxor_proxy_error",
+                            requestState.Phase).ConfigureAwait(false);
+                    }
                 }
                 finally
                 {
@@ -706,14 +842,21 @@ namespace CodexOpenRouter
                 }
             }
 
-            private async Task HandleAsync(HttpListenerContext context)
+            private async Task HandleAsync(
+                HttpListenerContext context,
+                ProxyRequestState requestState)
             {
                 HttpListenerRequest incoming = context.Request;
                 HttpListenerResponse outgoing = context.Response;
 
                 if (!TokenMatches(incoming.Headers[TokenHeader], token))
                 {
-                    await WriteErrorAsync(outgoing, 403, "Forbidden.").ConfigureAwait(false);
+                    await WriteErrorAsync(
+                        outgoing,
+                        403,
+                        "Forbidden.",
+                        "authentication_error",
+                        "proxy_token_invalid").ConfigureAwait(false);
                     return;
                 }
 
@@ -722,7 +865,7 @@ namespace CodexOpenRouter
                     string.Equals(incoming.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase))
                 {
                     byte[] health = Encoding.UTF8.GetBytes(
-                        "{\"status\":\"ok\",\"schema\":1,\"pid\":" +
+                        "{\"status\":\"ok\",\"schema\":2,\"pid\":" +
                         Environment.ProcessId.ToString() + "}");
                     outgoing.StatusCode = 200;
                     outgoing.ContentType = "application/json; charset=utf-8";
@@ -735,7 +878,12 @@ namespace CodexOpenRouter
                 if (!string.Equals(path, "/api/v1/responses", StringComparison.Ordinal) ||
                     !string.Equals(incoming.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteErrorAsync(outgoing, 404, "Endpoint not found.")
+                    await WriteErrorAsync(
+                        outgoing,
+                        404,
+                        "Endpoint not found.",
+                        "invalid_request_error",
+                        "endpoint_not_found")
                         .ConfigureAwait(false);
                     return;
                 }
@@ -745,12 +893,19 @@ namespace CodexOpenRouter
                         "application/json",
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteErrorAsync(outgoing, 415, "Content-Type must be application/json.")
+                    await WriteErrorAsync(
+                        outgoing,
+                        415,
+                        "Content-Type must be application/json.",
+                        "invalid_request_error",
+                        "unsupported_content_type")
                         .ConfigureAwait(false);
                     return;
                 }
 
+                requestState.Phase = "read_request";
                 byte[] requestBody = await ReadBodyAsync(incoming).ConfigureAwait(false);
+                requestState.Phase = "rewrite_request";
                 byte[] upstreamBody = RewriteRequestBody(requestBody);
                 string query = incoming.Url == null ? string.Empty : incoming.Url.Query;
                 var upstreamUri = new Uri(
@@ -762,22 +917,69 @@ namespace CodexOpenRouter
                 using (var cancellation = new CancellationTokenSource())
                 {
                     upstreamRequest.Content = content;
+                    requestState.Phase = "copy_request_headers";
                     CopyRequestHeaders(incoming, upstreamRequest);
                     upstreamRequest.Headers.Remove("Accept-Encoding");
                     upstreamRequest.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
                     content.Headers.Remove("Content-Type");
                     content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
 
+                    requestState.Phase = "send_upstream";
                     using (HttpResponseMessage upstream = await client.SendAsync(
                         upstreamRequest,
                         HttpCompletionOption.ResponseHeadersRead,
                         cancellation.Token).ConfigureAwait(false))
                     {
                         outgoing.StatusCode = (int)upstream.StatusCode;
-                        outgoing.SendChunked = true;
                         outgoing.KeepAlive = false;
-                        CopyResponseHeaders(upstream, outgoing);
+                        requestState.Phase = "copy_response_headers";
 
+                        if (!upstream.IsSuccessStatusCode)
+                        {
+                            CopyErrorResponseHeaders(upstream, outgoing);
+                            requestState.Phase = "read_upstream_error";
+                            byte[] rawError;
+                            using (var errorCancellation =
+                                new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+                            {
+                                rawError = await ReadErrorBodyAsync(
+                                    upstream.Content,
+                                    errorCancellation.Token).ConfigureAwait(false);
+                            }
+                            string errorText;
+                            try
+                            {
+                                errorText = new UTF8Encoding(false, true).GetString(rawError);
+                            }
+                            catch (DecoderFallbackException)
+                            {
+                                errorText = string.Empty;
+                            }
+                            byte[] normalizedError = Encoding.UTF8.GetBytes(
+                                NormalizeUpstreamErrorJson(
+                                    errorText,
+                                    (int)upstream.StatusCode));
+                            outgoing.SendChunked = false;
+                            outgoing.ContentType = "application/json; charset=utf-8";
+                            outgoing.ContentLength64 = normalizedError.Length;
+                            TrySetResponseHeader(outgoing, ErrorSourceHeader, "upstream");
+                            TrySetResponseHeader(
+                                outgoing,
+                                ErrorCodeHeader,
+                                "upstream_http_" + ((int)upstream.StatusCode).ToString());
+                            requestState.Phase = "write_downstream_error";
+                            requestState.ResponseStarted = true;
+                            await outgoing.OutputStream.WriteAsync(
+                                normalizedError,
+                                0,
+                                normalizedError.Length).ConfigureAwait(false);
+                            return;
+                        }
+
+                        CopyResponseHeaders(upstream, outgoing);
+                        outgoing.SendChunked = true;
+
+                        requestState.Phase = "open_upstream_stream";
                         using (Stream source = await upstream.Content.ReadAsStreamAsync()
                             .ConfigureAwait(false))
                         {
@@ -786,9 +988,12 @@ namespace CodexOpenRouter
                             {
                                 while (true)
                                 {
+                                    requestState.Phase = "read_upstream";
                                     int read = await source.ReadAsync(buffer, 0, buffer.Length)
                                         .ConfigureAwait(false);
                                     if (read == 0) break;
+                                    requestState.Phase = "write_downstream";
+                                    requestState.ResponseStarted = true;
                                     await outgoing.OutputStream.WriteAsync(buffer, 0, read)
                                         .ConfigureAwait(false);
                                     await outgoing.OutputStream.FlushAsync().ConfigureAwait(false);
@@ -800,6 +1005,29 @@ namespace CodexOpenRouter
                                 throw;
                             }
                         }
+                    }
+                }
+            }
+
+            private static async Task<byte[]> ReadErrorBodyAsync(
+                HttpContent content,
+                CancellationToken cancellationToken)
+            {
+                using (Stream source = await content.ReadAsStreamAsync().ConfigureAwait(false))
+                using (var memory = new MemoryStream())
+                {
+                    byte[] buffer = new byte[8192];
+                    while (true)
+                    {
+                        int remaining = MaximumErrorResponseBytes + 1 - (int)memory.Length;
+                        if (remaining <= 0) return Array.Empty<byte>();
+                        int read = await source.ReadAsync(
+                            buffer,
+                            0,
+                            Math.Min(buffer.Length, remaining),
+                            cancellationToken).ConfigureAwait(false);
+                        if (read == 0) return memory.ToArray();
+                        memory.Write(buffer, 0, read);
                     }
                 }
             }
@@ -856,20 +1084,62 @@ namespace CodexOpenRouter
                     CopyResponseHeader(header.Key, header.Value, outgoing);
             }
 
+            private static void CopyErrorResponseHeaders(
+                HttpResponseMessage upstream,
+                HttpListenerResponse outgoing)
+            {
+                foreach (var header in upstream.Headers)
+                {
+                    if (!SafeErrorResponseHeaders.Contains(header.Key) &&
+                        !header.Key.StartsWith(
+                            "x-ratelimit-",
+                            StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    CopyResponseHeader(header.Key, header.Value, outgoing);
+                }
+            }
+
             private static void CopyResponseHeader(
                 string name,
                 IEnumerable<string> values,
                 HttpListenerResponse outgoing)
             {
                 if (HopByHopHeaders.Contains(name)) return;
+                if (string.Equals(name, ErrorCodeHeader, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(name, ErrorSourceHeader, StringComparison.OrdinalIgnoreCase))
+                    return;
+                if (string.Equals(name, "Set-Cookie", StringComparison.OrdinalIgnoreCase))
+                    return;
                 if (string.Equals(name, "Content-Type", StringComparison.OrdinalIgnoreCase))
                 {
-                    outgoing.ContentType = string.Join(", ", values);
+                    try
+                    {
+                        foreach (string value in values)
+                        {
+                            if (string.IsNullOrWhiteSpace(value)) continue;
+                            outgoing.ContentType = value;
+                            break;
+                        }
+                    }
+                    catch (ArgumentException) { }
+                    catch (InvalidOperationException) { }
                     return;
                 }
                 try { outgoing.Headers[name] = string.Join(", ", values); }
                 catch (ArgumentException) { }
                 catch (InvalidOperationException) { }
+                catch (NotSupportedException) { }
+            }
+
+            private static void TrySetResponseHeader(
+                HttpListenerResponse response,
+                string name,
+                string value)
+            {
+                try { response.Headers[name] = value; }
+                catch (ArgumentException) { }
+                catch (InvalidOperationException) { }
+                catch (NotSupportedException) { }
             }
 
             private static bool TokenMatches(string supplied, string expected)
@@ -884,16 +1154,21 @@ namespace CodexOpenRouter
             private static async Task WriteErrorAsync(
                 HttpListenerResponse response,
                 int statusCode,
-                string message)
+                string message,
+                string type,
+                string code)
             {
                 try
                 {
                     if (response.OutputStream == null) return;
-                    byte[] body = Encoding.UTF8.GetBytes(
-                        "{\"error\":\"" + message.Replace("\"", "") + "\"}");
+                    byte[] body = Encoding.UTF8.GetBytes(CreateErrorJson(message, type, code));
+                    try { response.Headers.Clear(); } catch { }
                     response.StatusCode = statusCode;
+                    response.SendChunked = false;
                     response.ContentType = "application/json; charset=utf-8";
                     response.ContentLength64 = body.Length;
+                    TrySetResponseHeader(response, ErrorSourceHeader, "local");
+                    TrySetResponseHeader(response, ErrorCodeHeader, code);
                     await response.OutputStream.WriteAsync(body, 0, body.Length)
                         .ConfigureAwait(false);
                 }
@@ -908,6 +1183,12 @@ namespace CodexOpenRouter
             }
 
             private sealed class RequestTooLargeException : Exception { }
+
+            private sealed class ProxyRequestState
+            {
+                internal string Phase { get; set; } = "accept_request";
+                internal bool ResponseStarted { get; set; }
+            }
         }
     }
 }
@@ -924,7 +1205,7 @@ function Start-CxProxyServer {
         throw '缓存代理缺少有效的启动令牌。'
     }
     Initialize-CxProxyType
-    [CodexOpenRouter.OpenRouterCacheProxyV1]::RunAsync($Port, $token).
+    [CodexOpenRouter.OpenRouterCacheProxyV2]::RunAsync($Port, $token).
         GetAwaiter().GetResult()
 }
 
@@ -964,7 +1245,7 @@ function Get-CxProxyState {
     }
     catch { return $null }
     $started = [DateTimeOffset]::MinValue
-    if ($schema -ne 1 -or
+    if ($schema -notin @(1, 2) -or
         $processId -le 0 -or
         $port -lt 1024 -or $port -gt 65535 -or
         [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
@@ -981,7 +1262,7 @@ function Get-CxProxyState {
     catch { return $null }
 
     return [pscustomobject]@{
-        Schema = 1
+        Schema = $schema
         ProcessId = $processId
         Port = $port
         Token = [string]$data.token
@@ -1008,6 +1289,20 @@ function Test-CxProxyProcess {
     catch { return $false }
 }
 
+function Test-CxProxyHealthContent {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)][int]$ExpectedProcessId
+    )
+
+    if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt 1024) { return $false }
+    try { $health = $Content | ConvertFrom-Json -ErrorAction Stop }
+    catch { return $false }
+    return [string]$health.status -ceq 'ok' -and
+        [int]$health.schema -eq 2 -and
+        [int]$health.pid -eq $ExpectedProcessId
+}
+
 function Test-CxProxyHealth {
     param([Parameter(Mandatory)][object]$State)
 
@@ -1029,11 +1324,9 @@ function Test-CxProxyHealth {
         try {
             if (-not $response.IsSuccessStatusCode) { return $false }
             $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            if ([Text.Encoding]::UTF8.GetByteCount($body) -gt 1024) { return $false }
-            $health = $body | ConvertFrom-Json -ErrorAction Stop
-            return [string]$health.status -ceq 'ok' -and
-                [int]$health.schema -eq 1 -and
-                [int]$health.pid -eq [int]$State.ProcessId
+            return Test-CxProxyHealthContent `
+                -Content $body `
+                -ExpectedProcessId ([int]$State.ProcessId)
         }
         finally { $response.Dispose() }
     }
@@ -1111,7 +1404,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
             StartedUtc = $startedUtc
         }
         $healthy = $false
-        foreach ($attempt in 1..50) {
+        foreach ($attempt in 1..150) {
             if ($process.HasExited) { break }
             if (Test-CxProxyHealth $probeState) { $healthy = $true; break }
             Start-Sleep -Milliseconds 100
@@ -1130,7 +1423,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
         }
 
         $stateContent = [ordered]@{
-            schema = 1
+            schema = 2
             pid = $process.Id
             port = $Port
             token = $Token
@@ -1163,6 +1456,8 @@ function Ensure-CxOpenRouterProxy {
 
     $mutex = Enter-CxMutex $StatePath
     try {
+        $portWasSpecified = $Port -ne 0
+        $tokenWasSpecified = -not [string]::IsNullOrWhiteSpace($Token)
         $stateFileExists = Test-Path -LiteralPath $StatePath
         $state = Get-CxProxyState -StatePath $StatePath
         $processMatches = $null -ne $state -and (Test-CxProxyProcess $state)
@@ -1185,20 +1480,26 @@ function Ensure-CxOpenRouterProxy {
         }
         if ($stateFileExists) { Remove-CxProxyStateFile -StatePath $StatePath }
 
-        $fixedPort = $Port -ne 0
-        if (-not $fixedPort) { $Port = Get-CxFreeLoopbackPort }
+        if (-not $portWasSpecified -and $null -ne $state) {
+            $Port = [int]$state.Port
+        }
+        if ($Port -eq 0) { $Port = Get-CxFreeLoopbackPort }
+        if (-not $tokenWasSpecified -and $null -ne $state) {
+            $Token = [string]$state.Token
+        }
         if ([string]::IsNullOrWhiteSpace($Token)) {
             $Token = [Convert]::ToHexString(
                 [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
             )
         }
-        $attempts = if ($fixedPort) { 1 } else { 5 }
+        $attempts = if ($portWasSpecified) { 1 } else { 5 }
         for ($attempt = 1; $attempt -le $attempts; $attempt++) {
             try {
                 return Start-CxOpenRouterProxy -StatePath $StatePath `
                     -Port $Port -Token $Token
             }
             catch {
+                if ($_.Exception.Message -like '*upstream_network_or_tls*') { throw }
                 if ($attempt -eq $attempts) { throw }
                 $Port = Get-CxFreeLoopbackPort
             }
@@ -1917,7 +2218,8 @@ function Invoke-CxMode {
     param(
         [Parameter(Mandatory)][ValidateSet('Default', 'OpenRouter')][string]$Mode,
         [switch]$SetKey,
-        [switch]$AllModels
+        [switch]$AllModels,
+        [switch]$StopProxy
     )
 
     Assert-CxRuntime
@@ -1974,7 +2276,7 @@ function Invoke-CxMode {
         try {
             Commit-CxConfigChange $change
             $committed = $true
-            if ($Mode -eq 'Default') {
+            if ($Mode -eq 'Default' -and $StopProxy) {
                 try { [void](Stop-CxOpenRouterProxy -StatePath $paths.ProxyStatePath) }
                 catch {
                     Write-Warning "默认配置已恢复，但缓存代理清理失败：$($_.Exception.Message)"
@@ -2001,15 +2303,20 @@ function Invoke-CxMode {
                 "全模型缓存感知代理已就绪，并请求打开 OpenRouter Codex。"
             )
         }
-        else { Write-Host 'cx：已请求打开默认 Codex。' }
+        elseif ($StopProxy) {
+            Write-Host 'cx：已请求打开默认 Codex，并停止缓存代理。'
+        }
+        else {
+            Write-Host 'cx：已请求打开默认 Codex；缓存代理继续服务已打开的 OpenRouter 任务。'
+        }
     }
     finally { Exit-CxMutex $mutex }
 }
 
 function cx {
     [CmdletBinding()]
-    param()
-    Invoke-CxMode -Mode Default
+    param([switch]$StopProxy)
+    Invoke-CxMode -Mode Default -StopProxy:$StopProxy
 }
 
 function cxor {

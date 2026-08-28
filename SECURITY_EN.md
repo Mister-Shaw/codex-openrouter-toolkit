@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes apply only to the current version, `0.1.8`. Users of older versions should update before checking whether an issue still occurs.
+Security fixes apply only to the current version, `0.1.9`. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 
@@ -30,7 +30,7 @@ The installer places the module in the current user's PowerShell module director
 
 Running `cxor` writes `<CODEX_HOME>/openrouter-model-catalog.json` and `<CODEX_HOME>/openrouter-cache-proxy.json`, starts a background PowerShell proxy bound only to a random high port on `127.0.0.1`, and adds the toolkit-managed OpenRouter configuration to `config.toml`. The TOML and proxy state file contain a randomly generated 256-bit local proxy token. This token only guards the loopback listener against accidental local use and carries no OpenRouter account authority.
 
-Running `cx` stops the verified background proxy, removes its state file, and removes `model`, `model_provider`, `model_reasoning_effort`, `model_catalog_json`, and the managed OpenRouter provider while preserving other configuration. The uninstaller also stops the proxy and removes the catalog and state files.
+Running `cx` removes `model`, `model_provider`, `model_reasoning_effort`, `model_catalog_json`, and the managed OpenRouter provider while preserving other configuration. The verified background proxy and state file remain available to OpenRouter tasks that are already open. Running `cx -StopProxy` or the uninstaller stops the proxy and removes its state; the uninstaller also removes the catalog.
 
 The toolkit does not modify `models_cache.json`, create `settings.json`, or maintain persistent backups. Managed text is replaced with a temporary file in the same directory, and concurrent modification is checked before commit. Back up important custom Codex configuration separately.
 

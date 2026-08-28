@@ -4,7 +4,7 @@
 
 ## 支持版本
 
-安全修复只面向当前版本 `0.1.8`。旧版本用户应先更新，再确认问题是否仍然存在。
+安全修复只面向当前版本 `0.1.9`。旧版本用户应先更新，再确认问题是否仍然存在。
 
 ## API Key
 
@@ -30,7 +30,7 @@
 
 运行 `cxor` 会写入 `<CODEX_HOME>/openrouter-model-catalog.json` 和 `<CODEX_HOME>/openrouter-cache-proxy.json`，启动一个仅绑定 `127.0.0.1` 随机高位端口的后台 PowerShell 代理，并在 `config.toml` 中加入工具包托管的 OpenRouter 配置。TOML 与代理状态文件会保存一个随机生成的 256 位本地代理令牌；该令牌只用于阻止其他本地进程误用监听端口，不具备 OpenRouter 账户权限。
 
-运行 `cx` 会停止经过身份校验的后台代理，删除代理状态文件，并移除 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置。卸载器也会停止代理并清理目录与状态文件。
+运行 `cx` 会移除 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置；经过身份校验的后台代理与状态文件继续服务已经打开的 OpenRouter 任务。运行 `cx -StopProxy` 或卸载器会停止代理并清理状态文件，卸载器还会清理目录。
 
 工具包不操作 `models_cache.json`，也不创建 `settings.json` 或持续备份。受管文本采用同目录临时文件替换，并在提交前检查并发修改。重要的自定义 Codex 配置仍建议由用户自行备份。
 

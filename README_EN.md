@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.8`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.9`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -11,7 +11,8 @@ A community-maintained Windows PowerShell toolkit that switches Codex Desktop be
 
 | Command | Description |
 | --- | --- |
-| `cx` | Removes the toolkit-managed model and OpenRouter settings, stops the local proxy, and requests that Codex Desktop open in its default mode. |
+| `cx` | Removes the toolkit-managed model and OpenRouter settings, keeps the proxy available to open tasks, and requests that Codex Desktop open in its default mode. |
+| `cx -StopProxy` | Returns to default Codex and immediately stops the local proxy. Open OpenRouter tasks can no longer use that loopback endpoint. |
 | `cxor` | Synchronizes the latest Codex-compatible OpenRouter catalog, starts the local cache-aware proxy, shows a curated set of Claude and OpenAI models, switches to OpenRouter, and requests a desktop restart. |
 | `cxor -SetKey` | Securely prompts for and stores or rotates the current Windows user's OpenRouter API key, then enters OpenRouter mode. |
 | `cxor -AllModels` | Makes every model in the selected validated OpenRouter catalog visible. May be combined with `-SetKey`. |
@@ -73,7 +74,7 @@ Return to default Codex mode:
 cx
 ```
 
-`cx` removes the toolkit-managed `model`, `model_provider`, `model_reasoning_effort`, and `model_catalog_json` keys, together with the managed OpenRouter provider block. Other Codex settings are preserved. It then stops the local cache-aware proxy, removes its state file, and requests that Codex Desktop reopen.
+`cx` removes the toolkit-managed `model`, `model_provider`, `model_reasoning_effort`, and `model_catalog_json` keys, together with the managed OpenRouter provider block. Other Codex settings are preserved, and Codex Desktop is asked to reopen. The proxy and its state file remain available by default so OpenRouter tasks that already hold the loopback address can finish. Run `cx -StopProxy` to stop it immediately.
 
 Rotate the API key:
 
@@ -101,7 +102,9 @@ In OpenRouter mode, every OpenRouter Responses API request from Codex first pass
 
 The local proxy does not maintain a local prompt-content cache. Every turn still uploads the complete request to OpenRouter; an upstream cache hit reuses the model's previously computed prompt prefix. The first request still reports the complete input-token count, and creating a Claude cache can cost more than ordinary input. To verify actual cache activity, inspect `usage.input_tokens_details.cached_tokens` and `cache_write_tokens` in the Responses usage object. A positive `cached_tokens` value indicates a cache read, while a positive `cache_write_tokens` value indicates a write. Total input tokens alone do not establish whether a cache hit occurred.
 
-Proxy state is stored at `<CODEX_HOME>\openrouter-cache-proxy.json`, which defaults to `%USERPROFILE%\.codex\openrouter-cache-proxy.json`. The file contains the process identity, loopback port, random local access token, start time, and module path. It contains no OpenRouter API key, prompt, or response data. If the computer restarts or the proxy exits, the OpenRouter provider's command authentication validates and self-heals the proxy on the configured port with the configured token before reading the current user's API key. Running `cx` stops the proxy and deletes the state file; the uninstaller performs the same cleanup.
+Proxy state is stored at `<CODEX_HOME>\openrouter-cache-proxy.json`, which defaults to `%USERPROFILE%\.codex\openrouter-cache-proxy.json`. The file contains the process identity, loopback port, random local access token, start time, and module path. It contains no OpenRouter API key, prompt, or response data. If the computer restarts or the proxy exits, the OpenRouter provider's command authentication validates and self-heals the proxy on the configured port with the configured token before reading the current user's API key. `cx` keeps the proxy and state by default; `cx -StopProxy` and the uninstaller stop the process and remove the state file.
+
+For upstream non-success statuses, the proxy preserves the HTTP status and converts empty or legacy error bodies into an `error` object that Codex can read. Local forwarding failures return a fixed phase such as `send_upstream`, `copy_response_headers`, or `read_upstream`, with `x-cxor-error-source` identifying the source. Local phase diagnostics contain no API key, prompt, response body, query string, or exception stack.
 
 ## Updating and Uninstalling
 
@@ -123,6 +126,7 @@ The uninstaller stops the local proxy and removes its state, the user module, to
 - Empty `Content` errors, damaged CLI JSON, system-temp PATH alias warnings, or repeated stale-catalog warnings: update to version `0.1.8`. The catalog fixes force UTF-8 decoding for Codex CLI stdout and stderr, prioritize the direct OpenRouter catalog request, and use an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.
+- `502 Bad Gateway`: update to `0.1.9`, run `cxor` again from a regular PowerShell 7 window, and create a new task. The revised error body distinguishes an upstream OpenRouter HTTP status from a local proxy phase. A background proxy launched inside a Codex sandbox may inherit restricted TLS credentials.
 - `cached_tokens` remains zero: confirm that successive requests have the same long prefix, use the same model and a stable `prompt_cache_key`, and satisfy the model's minimum cacheable length and lifetime. The proxy continues to forward requests safely when a model or upstream provider has no caching support.
 
 ## Data and Security
