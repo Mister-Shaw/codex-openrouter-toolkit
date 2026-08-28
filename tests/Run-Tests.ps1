@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.3' `
+        -Expected '0.1.7' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -113,6 +113,88 @@ try {
         -Actual ($runtimeExports -join ',') `
         -Expected 'cx,cxor' `
         -Message 'Runtime exports only cx and cxor'
+
+    $moduleSource = Get-Content -LiteralPath (
+        Join-Path $repositoryRoot 'src\CodexOpenRouter\CodexOpenRouter.psm1'
+    ) -Raw
+    Assert-True `
+        -Condition ($moduleSource.Contains('$startInfo.StandardOutputEncoding = $utf8')) `
+        -Message 'CLI stdout decoding is pinned to UTF-8'
+    Assert-True `
+        -Condition ($moduleSource.Contains('$startInfo.StandardErrorEncoding = $utf8')) `
+        -Message 'CLI stderr decoding is pinned to UTF-8'
+
+    $requestKey = 'sk-' + 'or-' + ('q' * 24)
+    $requestResult = & $module {
+        param($ApiKey)
+
+        $request = New-CxOpenRouterCatalogRequest -ApiKey $ApiKey `
+            -ClientVersion '0.150.0'
+        try {
+            [pscustomobject]@{
+                Method = $request.Method.Method
+                Uri = $request.RequestUri.AbsoluteUri
+                AuthScheme = $request.Headers.Authorization.Scheme
+                AuthParameter = $request.Headers.Authorization.Parameter
+                Originator = @($request.Headers.GetValues('originator')) -join ','
+            }
+        }
+        finally { $request.Dispose() }
+    } $requestKey
+    Assert-Equal `
+        -Actual ([string]$requestResult.Method) `
+        -Expected 'GET' `
+        -Message 'OpenRouter catalog request uses GET'
+    Assert-Equal `
+        -Actual ([string]$requestResult.Uri) `
+        -Expected 'https://openrouter.ai/api/v1/models?client_version=0.150.0' `
+        -Message 'OpenRouter catalog request targets the versioned Codex endpoint'
+    Assert-Equal `
+        -Actual ([string]$requestResult.AuthScheme) `
+        -Expected 'Bearer' `
+        -Message 'OpenRouter catalog request uses bearer authentication'
+    Assert-Equal `
+        -Actual ([string]$requestResult.AuthParameter) `
+        -Expected $requestKey `
+        -Message 'OpenRouter catalog request carries the supplied key'
+    Assert-Equal `
+        -Actual ([string]$requestResult.Originator) `
+        -Expected 'Codex Desktop' `
+        -Message 'OpenRouter catalog request asks for the Codex-native schema'
+
+    $originalVersionInvoke = & $module {
+        (Get-Item -LiteralPath Function:\Invoke-CxProcess).ScriptBlock
+    }
+    try {
+        & $module {
+            function script:Invoke-CxProcess {
+                param(
+                    [string]$FilePath,
+                    [string[]]$ArgumentList,
+                    [hashtable]$Environment,
+                    [int]$TimeoutMilliseconds = 90000
+                )
+                [pscustomobject]@{
+                    ExitCode = 0
+                    StandardOutput = "codex-cli 0.150.0-alpha.12.2`r`n"
+                    StandardError = ''
+                }
+            }
+        }
+        $clientVersion = & $module {
+            Get-CxCodexClientVersion -CliPath 'C:\cx-test\codex.exe'
+        }
+        Assert-Equal `
+            -Actual ([string]$clientVersion) `
+            -Expected '0.150.0' `
+            -Message 'Codex client version uses the three-part catalog version'
+    }
+    finally {
+        & $module {
+            param($Original)
+            Set-Item -LiteralPath Function:\Invoke-CxProcess -Value $Original
+        } $originalVersionInvoke
+    }
 
     $tomlStringResult = & $module {
         $controlCharacters = -join @(
@@ -319,10 +401,10 @@ keep_tooling = "yes"
     $catalogResult = & $module {
         param($Content)
 
-        $converted = Convert-CxCatalogPrompt -Content $Content
+        $converted = Convert-CxCatalogPrompt -Content $Content -AllModels
         [pscustomobject]@{
             Converted = $converted
-            ConvertedAgain = Convert-CxCatalogPrompt -Content $converted
+            ConvertedAgain = Convert-CxCatalogPrompt -Content $converted -AllModels
             Instructions = $script:EmptyInstructions
         }
     } $catalogInput
@@ -377,6 +459,471 @@ keep_tooling = "yes"
         -Actual $catalogResult.ConvertedAgain `
         -Expected $catalogResult.Converted `
         -Message 'Catalog prompt conversion is idempotent'
+
+    $selectionCatalog = [ordered]@{
+        source = 'selection-test'
+        models = @(
+            [ordered]@{
+                slug = 'vendor/other-model'
+                display_name = 'Other Model'
+                visibility = 'list'
+            },
+            [ordered]@{
+                slug = 'anthropic/claude-sonnet-5'
+                display_name = 'Old Sonnet Name'
+                visibility = 'hide'
+            },
+            [ordered]@{
+                slug = 'OPENAI/GPT-5.6-SOL'
+                display_name = 'Old Sol Name'
+            },
+            [ordered]@{
+                slug = '~anthropic/claude-opus-latest'
+                display_name = 'Old Opus Alias'
+                visibility = 'hide'
+            },
+            [ordered]@{
+                slug = '~openai/gpt-latest'
+                display_name = 'Old GPT Alias'
+                visibility = 'hide'
+            },
+            [ordered]@{
+                slug = 'openai/gpt-5.3-codex'
+                display_name = 'Old Codex Name'
+                visibility = 'list'
+            }
+        )
+    } | ConvertTo-Json -Depth 10 -Compress
+    $selectionResult = & $module {
+        param($Content)
+
+        $curated = Convert-CxCatalogPrompt -Content $Content
+        [pscustomobject]@{
+            Curated = $curated
+            CuratedAgain = Convert-CxCatalogPrompt -Content $curated
+            AllModels = Convert-CxCatalogPrompt -Content $Content -AllModels
+        }
+    } $selectionCatalog
+    $curatedCatalog = $selectionResult.Curated | ConvertFrom-Json
+    $curatedModels = @($curatedCatalog.models)
+    $curatedVisible = @($curatedModels | Where-Object { $_.visibility -ceq 'list' })
+    Assert-Equal `
+        -Actual ($curatedVisible.slug -join ',') `
+        -Expected '~openai/gpt-latest,OPENAI/GPT-5.6-SOL,openai/gpt-5.3-codex,~anthropic/claude-opus-latest,anthropic/claude-sonnet-5' `
+        -Message 'Curated catalog lists only featured models in configured order'
+    Assert-Equal `
+        -Actual ([string]$curatedVisible[1].display_name) `
+        -Expected 'GPT-5.6 Sol' `
+        -Message 'Curated catalog normalizes featured display names case-insensitively'
+    Assert-Equal `
+        -Actual ([int]$curatedVisible[1].priority) `
+        -Expected 3 `
+        -Message 'Curated catalog assigns stable featured priority'
+    $curatedHidden = @($curatedModels | Where-Object { $_.visibility -ceq 'hide' })
+    Assert-Equal `
+        -Actual ($curatedHidden.slug -join ',') `
+        -Expected 'vendor/other-model' `
+        -Message 'Curated catalog hides non-featured models'
+    Assert-Equal `
+        -Actual $selectionResult.CuratedAgain `
+        -Expected $selectionResult.Curated `
+        -Message 'Curated catalog conversion is idempotent'
+
+    $allCatalog = $selectionResult.AllModels | ConvertFrom-Json
+    $allModels = @($allCatalog.models)
+    Assert-Equal `
+        -Actual ([string]$allModels[0].visibility) `
+        -Expected 'list' `
+        -Message 'All-model catalog keeps listed models visible'
+    Assert-Equal `
+        -Actual ([string]$allModels[1].visibility) `
+        -Expected 'list' `
+        -Message 'All-model catalog reveals previously hidden models'
+    Assert-Equal `
+        -Actual ([string]$allModels[2].visibility) `
+        -Expected 'list' `
+        -Message 'All-model catalog adds missing list visibility'
+    Assert-Equal `
+        -Actual ([string]$allModels[2].display_name) `
+        -Expected 'Old Sol Name' `
+        -Message 'All-model catalog preserves upstream display names'
+
+    Assert-ThrowsLike `
+        -Action {
+            & $module {
+                Convert-CxCatalogPrompt -Content '' | Out-Null
+            }
+        }.GetNewClosure() `
+        -Pattern '*模型目录内容为空*' `
+        -Message 'Catalog conversion reports empty content explicitly'
+
+    $resolverKey = 'sk-' + 'or-' + ('r' * 24)
+    $resolverResult = & $module {
+        param($ValidCatalog, $ApiKey)
+
+        Resolve-CxCatalogCandidate -Candidates @(
+            [pscustomobject]@{
+                Label = 'stdout'
+                Content = '{invalid-json'
+                IsPrevious = $false
+            },
+            [pscustomobject]@{
+                Label = 'provider cache'
+                Content = ''
+                IsPrevious = $false
+            },
+            [pscustomobject]@{
+                Label = 'previous catalog'
+                Content = $ValidCatalog
+                IsPrevious = $true
+            }
+        ) -ApiKey $ApiKey -StandardError ''
+    } $selectionCatalog $resolverKey
+    Assert-Equal `
+        -Actual ([string]$resolverResult.Source) `
+        -Expected 'previous catalog' `
+        -Message 'Catalog resolver skips invalid and empty candidates'
+    Assert-True `
+        -Condition ([bool]$resolverResult.UsedPreviousCatalog) `
+        -Message 'Catalog resolver reports previous-catalog fallback'
+    Assert-Equal `
+        -Actual @($resolverResult.Models).Count `
+        -Expected 6 `
+        -Message 'Catalog resolver returns the selected models'
+
+    $resolverFailure = $null
+    try {
+        & $module {
+            param($ApiKey)
+
+            Resolve-CxCatalogCandidate -Candidates @(
+                [pscustomobject]@{ Label = 'stdout'; Content = '' },
+                [pscustomobject]@{ Label = 'cache'; Content = ' ' }
+            ) -ApiKey $ApiKey -StandardError "upstream rejected $ApiKey"
+        } $resolverKey | Out-Null
+    }
+    catch { $resolverFailure = $_.Exception.Message }
+    Assert-True `
+        -Condition (-not [string]::IsNullOrWhiteSpace($resolverFailure)) `
+        -Message 'Catalog resolver throws when every candidate is empty'
+    Assert-True `
+        -Condition ($resolverFailure -like '*stdout：空或不存在*cache：空或不存在*') `
+        -Message 'Catalog resolver summarizes empty candidates'
+    Assert-True `
+        -Condition ($resolverFailure -notlike '*Cannot bind argument*') `
+        -Message 'Catalog resolver avoids the raw parameter binding error'
+    Assert-True `
+        -Condition (-not $resolverFailure.Contains($resolverKey)) `
+        -Message 'Catalog resolver redacts API keys from diagnostics'
+    Assert-True `
+        -Condition ($resolverFailure -like '*<redacted>*') `
+        -Message 'Catalog resolver marks redacted stderr content'
+
+    $syncTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'cx-sync-tests-' + [Guid]::NewGuid().ToString('N')
+    )
+    [void](New-Item -ItemType Directory -Path $syncTestRoot -ErrorAction Stop)
+    $originalInvokeCxProcess = & $module {
+        (Get-Item -LiteralPath Function:\Invoke-CxProcess).ScriptBlock
+    }
+    $originalGetCxCodexClientVersion = & $module {
+        (Get-Item -LiteralPath Function:\Get-CxCodexClientVersion).ScriptBlock
+    }
+    $originalInvokeCxOpenRouterCatalogRequest = & $module {
+        (Get-Item -LiteralPath Function:\Invoke-CxOpenRouterCatalogRequest).ScriptBlock
+    }
+    try {
+        & $module {
+            function script:Invoke-CxProcess {
+                param(
+                    [string]$FilePath,
+                    [string[]]$ArgumentList,
+                    [hashtable]$Environment,
+                    [int]$TimeoutMilliseconds = 90000
+                )
+
+                $script:SyncTestProcessCalls++
+                if (-not [string]::IsNullOrWhiteSpace($script:SyncTestCacheContent)) {
+                    Write-CxTextFileAtomic `
+                        -Path (Join-Path $Environment.CODEX_HOME $script:SyncTestCacheName) `
+                        -Content $script:SyncTestCacheContent
+                }
+                return [pscustomobject]@{
+                    ExitCode = $script:SyncTestExitCode
+                    StandardOutput = $script:SyncTestStandardOutput
+                    StandardError = $script:SyncTestStandardError
+                }
+            }
+            function script:Get-CxCodexClientVersion {
+                param([string]$CliPath)
+
+                $script:SyncTestVersionCalls++
+                return '0.150.0'
+            }
+            function script:Invoke-CxOpenRouterCatalogRequest {
+                param([string]$ApiKey, [string]$ClientVersion)
+
+                $script:SyncTestDirectCalls++
+                $script:SyncTestDirectVersion = $ClientVersion
+                if ($script:SyncTestDirectShouldFail) {
+                    throw "direct catalog unavailable $ApiKey"
+                }
+                return $script:SyncTestDirectContent
+            }
+        }
+
+        & $module {
+            param($DirectContent)
+            $script:SyncTestCacheName = 'models_cache.openrouter.json'
+            $script:SyncTestCacheContent = ''
+            $script:SyncTestExitCode = 0
+            $script:SyncTestStandardOutput = ''
+            $script:SyncTestStandardError = ''
+            $script:SyncTestProcessCalls = 0
+            $script:SyncTestVersionCalls = 0
+            $script:SyncTestDirectCalls = 0
+            $script:SyncTestDirectVersion = ''
+            $script:SyncTestDirectShouldFail = $false
+            $script:SyncTestDirectContent = $DirectContent
+        } $selectionCatalog
+        $directCatalogPath = Join-Path $syncTestRoot 'direct-catalog.json'
+        $directSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe'
+        } $directCatalogPath $resolverKey
+        $directCounters = & $module {
+            [pscustomobject]@{
+                Process = $script:SyncTestProcessCalls
+                Version = $script:SyncTestVersionCalls
+                Direct = $script:SyncTestDirectCalls
+                DirectVersion = $script:SyncTestDirectVersion
+            }
+        }
+        Assert-True `
+            -Condition (-not [bool]$directSync.UsedPreviousCatalog) `
+            -Message 'Synchronization publishes a fresh direct OpenRouter catalog'
+        Assert-Equal `
+            -Actual ([string]$directSync.CatalogSource) `
+            -Expected 'OpenRouter Codex API' `
+            -Message 'Synchronization reports the direct OpenRouter catalog source'
+        Assert-Equal `
+            -Actual ([int]$directCounters.Version) `
+            -Expected 1 `
+            -Message 'Direct synchronization resolves the CLI catalog version once'
+        Assert-Equal `
+            -Actual ([int]$directCounters.Direct) `
+            -Expected 1 `
+            -Message 'Direct synchronization calls the OpenRouter catalog once'
+        Assert-Equal `
+            -Actual ([string]$directCounters.DirectVersion) `
+            -Expected '0.150.0' `
+            -Message 'Direct synchronization sends the parsed client version'
+        Assert-Equal `
+            -Actual ([int]$directCounters.Process) `
+            -Expected 0 `
+            -Message 'Valid direct synchronization skips the CLI catalog fallback'
+
+        $providerCatalogPath = Join-Path $syncTestRoot 'provider-catalog.json'
+        & $module {
+            param($CacheContent)
+            $script:SyncTestCacheName = 'models_cache.openrouter.json'
+            $script:SyncTestCacheContent = $CacheContent
+            $script:SyncTestExitCode = 0
+            $script:SyncTestStandardOutput = ''
+            $script:SyncTestStandardError = ''
+            $script:SyncTestDirectShouldFail = $true
+            $script:SyncTestDirectContent = ''
+        } $selectionCatalog
+        $providerSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe'
+        } $providerCatalogPath $resolverKey
+        Assert-True `
+            -Condition (-not [bool]$providerSync.UsedPreviousCatalog) `
+            -Message 'Synchronization uses a valid provider-specific temporary cache'
+        Assert-Equal `
+            -Actual ([string]$providerSync.CatalogSource) `
+            -Expected '临时缓存 models_cache.openrouter.json' `
+            -Message 'Synchronization reports the provider-specific cache source'
+        Assert-Equal `
+            -Actual ([int]$providerSync.VisibleModelCount) `
+            -Expected 5 `
+            -Message 'Provider-cache synchronization applies curated visibility'
+        Assert-Equal `
+            -Actual @(Get-ChildItem -LiteralPath $syncTestRoot -Directory `
+                -Filter '.cxor-*' -ErrorAction SilentlyContinue).Count `
+            -Expected 0 `
+            -Message 'Synchronization removes its temporary CLI home'
+
+        $previousCatalogPath = Join-Path $syncTestRoot 'previous-catalog.json'
+        [IO.File]::WriteAllText(
+            $previousCatalogPath,
+            $selectionCatalog,
+            [Text.UTF8Encoding]::new($false)
+        )
+        & $module {
+            $script:SyncTestCacheContent = ''
+            $script:SyncTestExitCode = 0
+            $script:SyncTestStandardOutput = ''
+            $script:SyncTestStandardError = 'remote catalog unavailable'
+        }
+        $previousSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe'
+        } $previousCatalogPath $resolverKey
+        Assert-True `
+            -Condition ([bool]$previousSync.UsedPreviousCatalog) `
+            -Message 'Synchronization can reuse the last valid OpenRouter catalog'
+        Assert-Equal `
+            -Actual ([string]$previousSync.CatalogSource) `
+            -Expected '上次有效 OpenRouter 目录' `
+            -Message 'Synchronization reports the previous-catalog source'
+
+        $previousAllSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe' `
+                -AllModels
+        } $previousCatalogPath $resolverKey
+        Assert-True `
+            -Condition ([bool]$previousAllSync.UsedPreviousCatalog) `
+            -Message 'All-model synchronization can reuse the last valid catalog'
+        Assert-Equal `
+            -Actual ([int]$previousAllSync.VisibleModelCount) `
+            -Expected 6 `
+            -Message 'All-model fallback reveals every model in the previous catalog'
+        $publishedAllCatalog = Get-Content -Raw -LiteralPath $previousCatalogPath |
+            ConvertFrom-Json -ErrorAction Stop
+        Assert-Equal `
+            -Actual @($publishedAllCatalog.models | Where-Object {
+                    $_.visibility -ceq 'list'
+                }).Count `
+            -Expected 6 `
+            -Message 'All-model fallback publishes every model as visible'
+
+        $emptyCatalogPath = Join-Path $syncTestRoot 'missing-catalog.json'
+        $emptySyncFailure = $null
+        try {
+            & $module {
+                param($CatalogPath, $ApiKey)
+                Sync-CxOpenRouterCatalog `
+                    -CliPath 'C:\cx-test\codex.exe' `
+                    -ApiKey $ApiKey `
+                    -CatalogPath $CatalogPath `
+                    -AuthCommand 'C:\cx-test\powershell.exe'
+            } $emptyCatalogPath $resolverKey | Out-Null
+        }
+        catch { $emptySyncFailure = $_.Exception.Message }
+        Assert-True `
+            -Condition ($emptySyncFailure -like '*未返回可用模型目录*') `
+            -Message 'Synchronization reports all-empty catalog sources explicitly'
+        Assert-True `
+            -Condition ($emptySyncFailure -notlike '*Cannot bind argument*') `
+            -Message 'Synchronization never exposes the empty Content binding error'
+        Assert-True `
+            -Condition (-not (Test-Path -LiteralPath $emptyCatalogPath)) `
+            -Message 'Failed synchronization does not publish an empty catalog'
+
+        & $module {
+            param($CacheContent)
+            $script:SyncTestCacheContent = $CacheContent
+            $script:SyncTestExitCode = 23
+            $script:SyncTestStandardOutput = ''
+            $script:SyncTestStandardError = 'upstream unavailable'
+        } $selectionCatalog
+        $nonzeroCacheSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe'
+        } $emptyCatalogPath $resolverKey
+        Assert-Equal `
+            -Actual ([string]$nonzeroCacheSync.CatalogSource) `
+            -Expected '临时缓存 models_cache.openrouter.json' `
+            -Message 'Nonzero CLI exits still allow a validated temporary cache'
+        Assert-True `
+            -Condition (-not [bool]$nonzeroCacheSync.UsedPreviousCatalog) `
+            -Message 'Temporary cache after a nonzero CLI exit is fresh data'
+
+        & $module {
+            $script:SyncTestCacheContent = ''
+        }
+        $nonzeroPreviousSync = & $module {
+            param($CatalogPath, $ApiKey)
+            Sync-CxOpenRouterCatalog `
+                -CliPath 'C:\cx-test\codex.exe' `
+                -ApiKey $ApiKey `
+                -CatalogPath $CatalogPath `
+                -AuthCommand 'C:\cx-test\powershell.exe'
+        } $previousCatalogPath $resolverKey
+        Assert-True `
+            -Condition ([bool]$nonzeroPreviousSync.UsedPreviousCatalog) `
+            -Message 'Nonzero CLI exits still allow the last valid catalog'
+
+        $nonzeroMissingPath = Join-Path $syncTestRoot 'nonzero-missing-catalog.json'
+        $nonzeroFailure = $null
+        try {
+            & $module {
+                param($CatalogPath, $ApiKey)
+                Sync-CxOpenRouterCatalog `
+                    -CliPath 'C:\cx-test\codex.exe' `
+                    -ApiKey $ApiKey `
+                    -CatalogPath $CatalogPath `
+                    -AuthCommand 'C:\cx-test\powershell.exe'
+            } $nonzeroMissingPath $resolverKey | Out-Null
+        }
+        catch { $nonzeroFailure = $_.Exception.Message }
+        Assert-True `
+            -Condition ($nonzeroFailure -like '*退出码 23*upstream unavailable*') `
+            -Message 'Nonzero CLI exits remain visible when every fallback is invalid'
+        Assert-True `
+            -Condition (-not (Test-Path -LiteralPath $nonzeroMissingPath)) `
+            -Message 'Failed nonzero synchronization does not publish a catalog'
+    }
+    finally {
+        & $module {
+            param($Original)
+            Set-Item -LiteralPath Function:\Invoke-CxProcess -Value $Original
+        } $originalInvokeCxProcess
+        & $module {
+            param($Original)
+            Set-Item -LiteralPath Function:\Get-CxCodexClientVersion -Value $Original
+        } $originalGetCxCodexClientVersion
+        & $module {
+            param($Original)
+            Set-Item -LiteralPath Function:\Invoke-CxOpenRouterCatalogRequest `
+                -Value $Original
+            Remove-Variable -Scope Script -Name 'SyncTest*' -ErrorAction SilentlyContinue
+        } $originalInvokeCxOpenRouterCatalogRequest
+        $resolvedSyncTestRoot = [IO.Path]::GetFullPath($syncTestRoot)
+        $resolvedTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') +
+            [IO.Path]::DirectorySeparatorChar
+        if ($resolvedSyncTestRoot.StartsWith(
+                $resolvedTempRoot,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [IO.Path]::GetFileName($resolvedSyncTestRoot) -match '^cx-sync-tests-[0-9a-f]{32}$' -and
+            (Test-Path -LiteralPath $resolvedSyncTestRoot -PathType Container)) {
+            Remove-Item -LiteralPath $resolvedSyncTestRoot -Recurse -Force
+        }
+    }
 
     $duplicateCatalog = [ordered]@{
         models = @(
@@ -440,6 +987,7 @@ keep_tooling = "yes"
         $script:TestCommitCalls = 0
         $script:TestSyncShouldFail = $false
         $script:TestConfigModels = [Collections.Generic.List[string]]::new()
+        $script:TestAllModels = [Collections.Generic.List[bool]]::new()
 
         function script:Assert-CxRuntime { }
         function script:Get-CxPaths {
@@ -471,17 +1019,22 @@ keep_tooling = "yes"
                 [string]$CliPath,
                 [string]$ApiKey,
                 [string]$CatalogPath,
-                [string]$AuthCommand
+                [string]$AuthCommand,
+                [switch]$AllModels
             )
 
             $script:TestSyncCalls++
+            $script:TestAllModels.Add([bool]$AllModels)
             if ($script:TestSyncShouldFail) {
                 throw 'synthetic catalog synchronization failure'
             }
             return [pscustomobject]@{
                 Path = $CatalogPath
                 ModelCount = 3
+                VisibleModelCount = if ($AllModels) { 3 } else { 2 }
                 DefaultModel = '~openai/gpt-latest'
+                CatalogSource = 'test catalog'
+                UsedPreviousCatalog = $false
             }
         }
         function script:Get-CxConfigChange {
@@ -518,13 +1071,14 @@ keep_tooling = "yes"
         }
 
         cxor
-        cxor
+        cxor -AllModels
         $afterTwo = [pscustomobject]@{
             Sync = $script:TestSyncCalls
             Stop = $script:TestStopCalls
             Commit = $script:TestCommitCalls
             Start = $script:TestStartCalls
             Models = @($script:TestConfigModels)
+            AllModels = @($script:TestAllModels)
         }
 
         $script:TestSyncShouldFail = $true
@@ -538,6 +1092,7 @@ keep_tooling = "yes"
             FinalCommit = $script:TestCommitCalls
             FinalStart = $script:TestStartCalls
             FinalModels = @($script:TestConfigModels)
+            FinalAllModels = @($script:TestAllModels)
             Failure = $failure
         }
     }
@@ -562,6 +1117,10 @@ keep_tooling = "yes"
         -Expected '~openai/gpt-latest,~openai/gpt-latest' `
         -Message 'cxor writes the default model returned by each synchronization'
     Assert-Equal `
+        -Actual ($orchestration.AfterTwo.AllModels -join ',') `
+        -Expected 'False,True' `
+        -Message 'cxor passes curated and all-model modes to synchronization'
+    Assert-Equal `
         -Actual $orchestration.FinalSync `
         -Expected 3 `
         -Message 'A third cxor call attempts synchronization'
@@ -581,6 +1140,10 @@ keep_tooling = "yes"
         -Actual ($orchestration.FinalModels -join ',') `
         -Expected '~openai/gpt-latest,~openai/gpt-latest' `
         -Message 'Synchronization failure does not prepare a stale model config'
+    Assert-Equal `
+        -Actual ($orchestration.FinalAllModels -join ',') `
+        -Expected 'False,True,False' `
+        -Message 'Failed synchronization still records the requested catalog mode'
     Assert-True `
         -Condition ($orchestration.Failure -like '*synchronization failure*') `
         -Message 'Synchronization failure is reported to the caller'

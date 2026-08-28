@@ -5,6 +5,17 @@ $script:MaximumCatalogBytes = 50MB
 $script:ManagedBlockBegin = '# BEGIN CodexOpenRouter managed provider'
 $script:ManagedBlockEnd = '# END CodexOpenRouter managed provider'
 $script:EmptyInstructions = ''
+$script:FeaturedModels = @(
+    [pscustomobject]@{ Slug = '~openai/gpt-latest'; DisplayName = 'GPT Latest' }
+    [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol-pro'; DisplayName = 'GPT-5.6 Sol Pro' }
+    [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol'; DisplayName = 'GPT-5.6 Sol' }
+    [pscustomobject]@{ Slug = 'openai/gpt-5.6-terra'; DisplayName = 'GPT-5.6 Terra' }
+    [pscustomobject]@{ Slug = 'openai/gpt-5.3-codex'; DisplayName = 'GPT-5.3 Codex' }
+    [pscustomobject]@{ Slug = '~anthropic/claude-opus-latest'; DisplayName = 'Claude Opus Latest' }
+    [pscustomobject]@{ Slug = 'anthropic/claude-opus-5'; DisplayName = 'Claude Opus 5' }
+    [pscustomobject]@{ Slug = '~anthropic/claude-sonnet-latest'; DisplayName = 'Claude Sonnet Latest' }
+    [pscustomobject]@{ Slug = 'anthropic/claude-sonnet-5'; DisplayName = 'Claude Sonnet 5' }
+)
 
 function Assert-CxRuntime {
     if (-not $IsWindows) {
@@ -539,6 +550,9 @@ function Invoke-CxProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $startInfo.StandardOutputEncoding = $utf8
+    $startInfo.StandardErrorEncoding = $utf8
     foreach ($argument in $ArgumentList) { [void]$startInfo.ArgumentList.Add($argument) }
     foreach ($entry in $Environment.GetEnumerator()) {
         $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
@@ -566,6 +580,102 @@ function Invoke-CxProcess {
     finally { $process.Dispose() }
 }
 
+function Get-CxCodexClientVersion {
+    param([Parameter(Mandatory)][string]$CliPath)
+
+    $result = Invoke-CxProcess -FilePath $CliPath -ArgumentList @('--version') `
+        -Environment @{} -TimeoutMilliseconds 10000
+    if ($result.ExitCode -ne 0) {
+        throw "Codex CLI 版本查询返回退出码 $($result.ExitCode)：$($result.StandardError)"
+    }
+    $match = [regex]::Match(
+        [string]$result.StandardOutput,
+        '(?m)^\s*codex-cli\s+(?<version>\d+\.\d+\.\d+)(?:[-+][^\s]+)?\s*$'
+    )
+    if (-not $match.Success) {
+        throw 'Codex CLI 未返回可识别的三段版本号。'
+    }
+    return $match.Groups['version'].Value
+}
+
+function New-CxOpenRouterCatalogRequest {
+    param(
+        [Parameter(Mandatory)][string]$ApiKey,
+        [Parameter(Mandatory)][string]$ClientVersion
+    )
+
+    if (-not (Test-CxApiKey $ApiKey)) { throw 'OpenRouter API Key 格式无效。' }
+    if ($ClientVersion -notmatch '^\d+\.\d+\.\d+$') {
+        throw 'Codex CLI 客户端版本无效。'
+    }
+    $encodedVersion = [Uri]::EscapeDataString($ClientVersion)
+    $uri = [Uri]::new(
+        "https://openrouter.ai/api/v1/models?client_version=$encodedVersion"
+    )
+    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $uri)
+    try {
+        $request.Headers.Authorization =
+            [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $ApiKey)
+        if (-not $request.Headers.TryAddWithoutValidation('originator', 'Codex Desktop')) {
+            throw '无法设置 OpenRouter 模型目录请求头。'
+        }
+        return $request
+    }
+    catch {
+        $request.Dispose()
+        throw
+    }
+}
+
+function Invoke-CxOpenRouterCatalogRequest {
+    param(
+        [Parameter(Mandatory)][string]$ApiKey,
+        [Parameter(Mandatory)][string]$ClientVersion
+    )
+
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $client = $null
+    $request = $null
+    $response = $null
+    try {
+        $handler.AllowAutoRedirect = $false
+        $handler.AutomaticDecompression =
+            [Net.DecompressionMethods]::GZip -bor
+            [Net.DecompressionMethods]::Deflate -bor
+            [Net.DecompressionMethods]::Brotli
+        $client = [Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(60)
+        $client.MaxResponseContentBufferSize = $script:MaximumCatalogBytes
+        $request = New-CxOpenRouterCatalogRequest -ApiKey $ApiKey `
+            -ClientVersion $ClientVersion
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -lt 200 -or $statusCode -ge 300) {
+            throw "OpenRouter 模型目录请求返回 HTTP $statusCode。"
+        }
+        $contentLength = $response.Content.Headers.ContentLength
+        if ($null -ne $contentLength -and $contentLength -gt $script:MaximumCatalogBytes) {
+            throw 'OpenRouter 模型目录响应超过大小限制。'
+        }
+        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+        if ($bytes.Length -gt $script:MaximumCatalogBytes) {
+            throw 'OpenRouter 模型目录响应超过大小限制。'
+        }
+        try { $content = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) }
+        catch { throw 'OpenRouter 模型目录响应不是有效 UTF-8。' }
+        if ($content.Contains($ApiKey)) {
+            throw 'OpenRouter 模型目录响应包含 API Key。'
+        }
+        return $content
+    }
+    finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $request) { $request.Dispose() }
+        if ($null -ne $client) { $client.Dispose() }
+        else { $handler.Dispose() }
+    }
+}
+
 function Set-CxObjectProperty {
     param([Parameter(Mandatory)][object]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()]$Value)
     $property = $Object.PSObject.Properties[$Name]
@@ -574,8 +684,14 @@ function Set-CxObjectProperty {
 }
 
 function Convert-CxCatalogPrompt {
-    param([Parameter(Mandatory)][string]$Content)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [switch]$AllModels
+    )
 
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        throw '模型目录内容为空。'
+    }
     if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt $script:MaximumCatalogBytes) {
         throw '模型目录超过大小限制。'
     }
@@ -611,6 +727,50 @@ function Convert-CxCatalogPrompt {
         Set-CxObjectProperty -Object $messages -Name 'instructions_template' -Value $script:EmptyInstructions
     }
 
+    if ($AllModels) {
+        foreach ($model in $models) {
+            Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'list'
+        }
+    }
+    else {
+        $featuredBySlug = @{}
+        for ($index = 0; $index -lt $script:FeaturedModels.Count; $index++) {
+            $definition = $script:FeaturedModels[$index]
+            $featuredBySlug[[string]$definition.Slug] = [pscustomobject]@{
+                DisplayName = [string]$definition.DisplayName
+                Priority = $index + 1
+            }
+        }
+
+        $featured = [Collections.Generic.List[object]]::new()
+        $hidden = [Collections.Generic.List[object]]::new()
+        foreach ($model in $models) {
+            $slug = [string]$model.slug
+            if ($featuredBySlug.ContainsKey($slug)) {
+                $definition = $featuredBySlug[$slug]
+                Set-CxObjectProperty -Object $model -Name 'display_name' -Value $definition.DisplayName
+                Set-CxObjectProperty -Object $model -Name 'priority' -Value $definition.Priority
+                Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'list'
+                $featured.Add($model)
+            }
+            else {
+                Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'hide'
+                $hidden.Add($model)
+            }
+        }
+
+        $orderedModels = @(
+            foreach ($definition in $script:FeaturedModels) {
+                foreach ($model in $featured) {
+                    if ([string]$model.slug -ieq [string]$definition.Slug) { $model }
+                }
+            }
+            foreach ($model in $hidden) { $model }
+        )
+        $modelsProperty.Value = $orderedModels
+        $models = $orderedModels
+    }
+
     $json = $catalog | ConvertTo-Json -Depth 100 -Compress
     if ([Text.Encoding]::UTF8.GetByteCount($json) -gt $script:MaximumCatalogBytes -or
         $json -cmatch 'sk-or-[A-Za-z0-9._-]{8,}') {
@@ -641,69 +801,241 @@ function Convert-CxCatalogPrompt {
     return $json
 }
 
+function Resolve-CxCatalogCandidate {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [switch]$AllModels,
+        [AllowNull()][string]$ApiKey,
+        [AllowEmptyString()][string]$StandardError = ''
+    )
+
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidate in $Candidates) {
+        $labelProperty = if ($null -eq $candidate) {
+            $null
+        }
+        else { $candidate.PSObject.Properties['Label'] }
+        $label = if ($null -eq $labelProperty -or
+            [string]::IsNullOrWhiteSpace([string]$labelProperty.Value)) {
+            '未命名候选'
+        }
+        else { [string]$labelProperty.Value }
+        $contentProperty = if ($null -eq $candidate) {
+            $null
+        }
+        else { $candidate.PSObject.Properties['Content'] }
+        $candidateContent = if ($null -eq $contentProperty -or
+            $null -eq $contentProperty.Value) {
+            ''
+        }
+        else { [string]$contentProperty.Value }
+
+        if ([string]::IsNullOrWhiteSpace($candidateContent)) {
+            $failureProperty = if ($null -eq $candidate) {
+                $null
+            }
+            else { $candidate.PSObject.Properties['Failure'] }
+            $failure = if ($null -eq $failureProperty -or
+                [string]::IsNullOrWhiteSpace([string]$failureProperty.Value)) {
+                '空或不存在'
+            }
+            else {
+                Protect-CxText ([string]$failureProperty.Value) $ApiKey
+            }
+            if ($failure.Length -gt 300) { $failure = $failure.Substring(0, 300) + '…' }
+            $failures.Add("$label：$failure")
+            continue
+        }
+        try {
+            $converted = Convert-CxCatalogPrompt -Content $candidateContent `
+                -AllModels:$AllModels
+            $convertedModels = @(($converted | ConvertFrom-Json -ErrorAction Stop).models)
+            if (@($convertedModels | Where-Object {
+                        $_.slug -ceq '~openai/gpt-latest'
+                    }).Count -ne 1) {
+                throw '缺少官方默认入口 ~openai/gpt-latest。'
+            }
+            $previousProperty = $candidate.PSObject.Properties['IsPrevious']
+            return [pscustomobject]@{
+                Content = $converted
+                Models = $convertedModels
+                Source = $label
+                UsedPreviousCatalog = $null -ne $previousProperty -and
+                    [bool]$previousProperty.Value
+            }
+        }
+        catch {
+            $safeMessage = Protect-CxText $_.Exception.Message $ApiKey
+            if ($safeMessage.Length -gt 300) {
+                $safeMessage = $safeMessage.Substring(0, 300) + '…'
+            }
+            $failures.Add("$label：$safeMessage")
+        }
+    }
+
+    $candidateDetail = if ($failures.Count -eq 0) {
+        '没有候选来源'
+    }
+    else { $failures -join '；' }
+    $safeError = Protect-CxText $StandardError $ApiKey
+    if ($safeError.Length -gt 1000) { $safeError = $safeError.Substring(0, 1000) + '…' }
+    $errorDetail = if ([string]::IsNullOrWhiteSpace($safeError)) { '无' } else { $safeError.Trim() }
+    throw "OpenRouter 与 Codex CLI 未返回可用模型目录。候选检查：$candidateDetail。Codex CLI stderr：$errorDetail"
+}
+
 function Sync-CxOpenRouterCatalog {
     param(
         [Parameter(Mandatory)][string]$CliPath,
         [Parameter(Mandatory)][string]$ApiKey,
         [Parameter(Mandatory)][string]$CatalogPath,
-        [Parameter(Mandatory)][string]$AuthCommand
+        [Parameter(Mandatory)][string]$AuthCommand,
+        [switch]$AllModels
     )
 
-    $temporaryHome = Join-Path ([IO.Path]::GetTempPath()) ('cxor-' + [Guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $temporaryHome -ErrorAction Stop)
+    $temporaryHome = ''
     try {
-        $provider = New-CxProviderBlock -AuthCommand $AuthCommand -ReadProcessEnvironment
-        $temporaryConfig = @(
-            'model = "~openai/gpt-latest"'
-            'model_provider = "openrouter"'
-            ''
-            $provider
-            ''
-        ) -join "`r`n"
-        Write-CxTextFileAtomic -Path (Join-Path $temporaryHome 'config.toml') -Content $temporaryConfig
-
-        $result = Invoke-CxProcess -FilePath $CliPath -ArgumentList @('debug', 'models') `
-            -Environment @{ CODEX_HOME = $temporaryHome; OPENROUTER_API_KEY = $ApiKey }
-        if ($result.StandardOutput.Contains($ApiKey) -or $result.StandardError.Contains($ApiKey)) {
-            throw 'Codex CLI 输出包含 API Key。'
-        }
-        if ($result.ExitCode -ne 0) {
-            throw "Codex CLI 返回退出码 $($result.ExitCode)：$($result.StandardError)"
-        }
-
-        $source = $result.StandardOutput
+        $candidates = [Collections.Generic.List[object]]::new()
+        $directContent = ''
+        $directFailure = ''
         try {
-            $stdoutCatalog = $source | ConvertFrom-Json -ErrorAction Stop
-            if ($null -eq $stdoutCatalog.PSObject.Properties['models']) {
-                throw 'stdout does not contain a Codex model catalog'
+            $clientVersion = Get-CxCodexClientVersion -CliPath $CliPath
+            $directContent = Invoke-CxOpenRouterCatalogRequest -ApiKey $ApiKey `
+                -ClientVersion $clientVersion
+        }
+        catch { $directFailure = Protect-CxText $_.Exception.Message $ApiKey }
+        $directCandidate = [pscustomobject]@{
+            Label = 'OpenRouter Codex API'
+            Content = $directContent
+            Failure = $directFailure
+            IsPrevious = $false
+        }
+        $candidates.Add($directCandidate)
+
+        $resolvedCatalog = $null
+        if (-not [string]::IsNullOrWhiteSpace($directContent)) {
+            try {
+                $resolvedCatalog = Resolve-CxCatalogCandidate `
+                    -Candidates @($directCandidate) -AllModels:$AllModels -ApiKey $ApiKey
             }
+            catch { $directFailure = Protect-CxText $_.Exception.Message $ApiKey }
         }
-        catch {
-            $cachePath = Join-Path $temporaryHome 'models_cache.json'
-            $source = Read-CxTextFile -Path $cachePath -MaximumBytes $script:MaximumCatalogBytes
+
+        if ($null -eq $resolvedCatalog) {
+            $catalogDirectory = [IO.Path]::GetDirectoryName(
+                [IO.Path]::GetFullPath($CatalogPath)
+            )
+            if ([string]::IsNullOrWhiteSpace($catalogDirectory) -or
+                -not (Test-Path -LiteralPath $catalogDirectory -PathType Container)) {
+                throw 'OpenRouter 模型目录的父目录不存在。'
+            }
+            $temporaryHome = Join-Path $catalogDirectory (
+                '.cxor-' + [Guid]::NewGuid().ToString('N')
+            )
+            [void](New-Item -ItemType Directory -Path $temporaryHome -ErrorAction Stop)
+
+            $provider = New-CxProviderBlock -AuthCommand $AuthCommand `
+                -ReadProcessEnvironment
+            $temporaryConfig = @(
+                'model = "~openai/gpt-latest"'
+                'model_provider = "openrouter"'
+                ''
+                $provider
+                ''
+            ) -join "`r`n"
+            Write-CxTextFileAtomic -Path (Join-Path $temporaryHome 'config.toml') `
+                -Content $temporaryConfig
+
+            $result = Invoke-CxProcess -FilePath $CliPath `
+                -ArgumentList @('debug', 'models') -Environment @{
+                    CODEX_HOME = $temporaryHome
+                    OPENROUTER_API_KEY = $ApiKey
+                }
+            $standardOutput = [string]$result.StandardOutput
+            $standardError = [string]$result.StandardError
+            if ($standardOutput.Contains($ApiKey) -or $standardError.Contains($ApiKey)) {
+                throw 'Codex CLI 输出包含 API Key。'
+            }
+            $cliDiagnostic = if ($result.ExitCode -eq 0) {
+                $standardError
+            }
+            else {
+                "Codex CLI 返回退出码 $($result.ExitCode)：$standardError"
+            }
+
+            $candidates.Add([pscustomobject]@{
+                    Label = 'Codex CLI stdout'
+                    Content = $standardOutput
+                    Failure = if ($result.ExitCode -eq 0) {
+                        ''
+                    }
+                    else { "Codex CLI 返回退出码 $($result.ExitCode)" }
+                    IsPrevious = $false
+                })
+
+            $seenCachePaths = [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::OrdinalIgnoreCase
+            )
+            $cachePaths = [Collections.Generic.List[string]]::new()
+            foreach ($cacheName in @('models_cache.openrouter.json', 'models_cache.json')) {
+                $cachePath = [IO.Path]::GetFullPath((Join-Path $temporaryHome $cacheName))
+                if ($seenCachePaths.Add($cachePath)) { $cachePaths.Add($cachePath) }
+            }
+            foreach ($cacheFile in @(Get-ChildItem -LiteralPath $temporaryHome -File `
+                        -Filter 'models_cache*.json' -ErrorAction SilentlyContinue |
+                    Sort-Object Name)) {
+                $cachePath = [IO.Path]::GetFullPath($cacheFile.FullName)
+                if ($seenCachePaths.Add($cachePath)) { $cachePaths.Add($cachePath) }
+            }
+            foreach ($cachePath in $cachePaths) {
+                $candidates.Add([pscustomobject]@{
+                        Label = "临时缓存 $([IO.Path]::GetFileName($cachePath))"
+                        Content = Read-CxTextFile -Path $cachePath `
+                            -MaximumBytes $script:MaximumCatalogBytes
+                        IsPrevious = $false
+                    })
+            }
+            $candidates.Add([pscustomobject]@{
+                    Label = '上次有效 OpenRouter 目录'
+                    Content = Read-CxTextFile -Path $CatalogPath `
+                        -MaximumBytes $script:MaximumCatalogBytes
+                    IsPrevious = $true
+                })
+
+            $resolvedCatalog = Resolve-CxCatalogCandidate -Candidates @($candidates) `
+                -AllModels:$AllModels -ApiKey $ApiKey -StandardError $cliDiagnostic
         }
-        $catalog = Convert-CxCatalogPrompt -Content $source
-        $writtenModels = @(($catalog | ConvertFrom-Json).models)
-        if (@($writtenModels | Where-Object { $_.slug -ceq '~openai/gpt-latest' }).Count -ne 1) {
-            throw 'OpenRouter 模型目录缺少官方默认入口 ~openai/gpt-latest。'
-        }
+        $catalog = [string]$resolvedCatalog.Content
+        $writtenModels = @($resolvedCatalog.Models)
         Write-CxTextFileAtomic -Path $CatalogPath -Content ($catalog + "`r`n")
         return [pscustomobject]@{
             Path = [IO.Path]::GetFullPath($CatalogPath)
             ModelCount = $writtenModels.Count
+            VisibleModelCount = @($writtenModels | Where-Object {
+                $_.PSObject.Properties['visibility'] -and $_.visibility -ceq 'list'
+            }).Count
             DefaultModel = '~openai/gpt-latest'
+            CatalogSource = [string]$resolvedCatalog.Source
+            UsedPreviousCatalog = [bool]$resolvedCatalog.UsedPreviousCatalog
         }
     }
     catch {
         throw "OpenRouter 模型目录同步失败：$(Protect-CxText $_.Exception.Message $ApiKey)"
     }
     finally {
-        $resolvedTemp = [IO.Path]::GetFullPath($temporaryHome)
-        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        if ($resolvedTemp.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
-            [IO.Path]::GetFileName($resolvedTemp) -match '^cxor-[0-9a-f]{32}$' -and
-            (Test-Path -LiteralPath $resolvedTemp -PathType Container)) {
-            Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($temporaryHome)) {
+            $resolvedTemp = [IO.Path]::GetFullPath($temporaryHome)
+            $catalogRoot = [IO.Path]::GetFullPath(
+                [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($CatalogPath))
+            ).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+            if ($resolvedTemp.StartsWith(
+                    $catalogRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [IO.Path]::GetFileName($resolvedTemp) -match '^\.cxor-[0-9a-f]{32}$' -and
+                (Test-Path -LiteralPath $resolvedTemp -PathType Container)) {
+                Remove-Item -LiteralPath $resolvedTemp -Recurse -Force `
+                    -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -809,7 +1141,8 @@ function Exit-CxMutex {
 function Invoke-CxMode {
     param(
         [Parameter(Mandatory)][ValidateSet('Default', 'OpenRouter')][string]$Mode,
-        [switch]$SetKey
+        [switch]$SetKey,
+        [switch]$AllModels
     )
 
     Assert-CxRuntime
@@ -826,7 +1159,11 @@ function Invoke-CxMode {
             $authCommand = Get-CxAuthPowerShell
             $cli = Get-CxCodexCliPath
             $catalogResult = Sync-CxOpenRouterCatalog -CliPath $cli -ApiKey $key `
-                -CatalogPath $paths.CatalogPath -AuthCommand $authCommand
+                -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
+                -AllModels:$AllModels
+            if ($catalogResult.UsedPreviousCatalog) {
+                Write-Warning 'OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。'
+            }
             $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode OpenRouter `
                 -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
                 -Model $catalogResult.DefaultModel
@@ -856,7 +1193,10 @@ function Invoke-CxMode {
         }
 
         if ($Mode -eq 'OpenRouter') {
-            Write-Host "cxor：已同步 $($catalogResult.ModelCount) 个模型并请求打开 OpenRouter Codex。"
+            Write-Host (
+                "cxor：已同步 $($catalogResult.ModelCount) 个模型，" +
+                "选择器显示 $($catalogResult.VisibleModelCount) 个模型，并请求打开 OpenRouter Codex。"
+            )
         }
         else { Write-Host 'cx：已请求打开默认 Codex。' }
     }
@@ -871,8 +1211,11 @@ function cx {
 
 function cxor {
     [CmdletBinding()]
-    param([switch]$SetKey)
-    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey
+    param(
+        [switch]$SetKey,
+        [switch]$AllModels
+    )
+    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey -AllModels:$AllModels
 }
 
 Export-ModuleMember -Function @('cx', 'cxor')

@@ -1,6 +1,6 @@
 # Codex OpenRouter Toolkit
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.3`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.7`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -10,10 +10,11 @@
 | 命令 | 作用 |
 | --- | --- |
 | `cx` | 移除工具包托管的模型与 OpenRouter 配置，请求打开默认 Codex |
-| `cxor` | 同步 OpenRouter 最新 Codex 兼容目录，将目录内每个模型的基础指令字段清空，切换到 OpenRouter，并请求重启桌面端 |
+| `cxor` | 同步 OpenRouter 最新 Codex 兼容目录，默认只显示 Claude 与 OpenAI 精选模型，切换到 OpenRouter，并请求重启桌面端 |
 | `cxor -SetKey` | 通过隐藏输入设置或轮换当前 Windows 用户的 OpenRouter API Key，然后进入 OpenRouter 模式 |
+| `cxor -AllModels` | 临时恢复完整 OpenRouter 模型列表；可与 `-SetKey` 组合 |
 
-`cxor` 每次运行都会重新同步目录，不使用 24 小时缓存。新目录只有通过结构、模型 ID、重复项和提示字段校验后才会写入；同步失败会保留旧目录、中止本次切换，并让正在运行的 Codex Desktop 保持原状。
+`cxor` 每次运行都会按当前 Codex CLI 三段版本号请求 OpenRouter 的 Codex 专用目录，不使用 24 小时缓存。请求失败时依次检查 CLI stdout、provider 专用缓存、通用缓存和上次有效目录。候选目录只有通过结构、模型 ID、重复项、默认入口和提示字段校验后才会写入；全部来源均不可用时中止切换。`-AllModels` 会把选中目录中的全部模型重新标记为可见。
 
 ## 要求
 
@@ -46,10 +47,22 @@ cxor
 
 1. 获取 OpenRouter 最新模型目录，并生成 Codex Desktop 可读取的兼容目录。
 2. 将每个模型的 `base_instructions` 与 `model_messages.instructions_template` 写为空字符串。
-3. 更新 Codex 配置，并向 Windows 提交桌面端重启请求。
-4. 在新的 Codex 任务中，从桌面模型选择器选择目录内模型。
+3. 默认显示 9 个 Claude / OpenAI 精选入口，并隐藏批处理、旧代和非对话模型。
+4. 更新 Codex 配置，并向 Windows 提交桌面端重启请求。
+5. 在新的 Codex 任务中，从桌面模型选择器选择目录内模型。
 
-目录必须包含官方入口 `~openai/gpt-latest`，它会作为初始模型；缺少该入口时，本次同步会在发布新目录前中止。完整目录仍会加载到桌面模型选择器。
+目录必须包含官方入口 `~openai/gpt-latest`，它会作为初始模型；缺少该入口时，本次同步会在发布新目录前中止。精选模式保留完整目录对象，并用 `visibility = "hide"` 隐藏未精选项目，以兼容引用旧 slug 的历史任务。
+
+默认精选模型：
+
+- GPT Latest、GPT-5.6 Sol Pro、GPT-5.6 Sol、GPT-5.6 Terra、GPT-5.3 Codex
+- Claude Opus Latest、Claude Opus 5、Claude Sonnet Latest、Claude Sonnet 5
+
+需要完整列表时运行：
+
+```powershell
+cxor -AllModels
+```
 
 返回默认 Codex 模式：
 
@@ -90,6 +103,7 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 
 - 找不到 `cx` / `cxor`：确认安装使用 PowerShell 7.4+，并检查用户模块目录是否位于 `$env:PSModulePath`。
 - 目录同步失败：检查 Key、余额、网络和 OpenRouter 服务状态。最后有效目录文件会保留，本次切换会中止，正在运行的桌面端不会被关闭。
+- 遇到 `Content` 为空、CLI JSON 损坏或持续显示旧目录告警：升级到 `0.1.7`；该版本固定使用 UTF-8 读取 CLI 输出，并优先请求 OpenRouter Codex 专用目录。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。
 
