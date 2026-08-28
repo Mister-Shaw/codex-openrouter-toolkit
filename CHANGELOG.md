@@ -2,6 +2,7 @@
 
 ## 0.1.2 - 2026-08-27
 
+- 修复 TOML 字符串编码器重复追加转义字符，导致 Windows 路径生成 `\\\` 并使 `cxor` 同步失败的问题。
 - `cx` 通过移除工具包托管的模型键与 OpenRouter provider 打开默认 Codex，不再依赖安装时快照。
 - `cxor` 每次启动 OpenRouter 模式前都会同步并校验最新 Codex 兼容模型目录，不再使用 24 小时缓存。
 - OpenRouter 初始模型固定使用官方入口 `~openai/gpt-latest`；目录缺失该项时拒绝发布，桌面选择器继续加载完整目录。

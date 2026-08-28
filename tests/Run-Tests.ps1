@@ -114,13 +114,37 @@ try {
         -Expected 'cx,cxor' `
         -Message 'Runtime exports only cx and cxor'
 
+    $tomlStringResult = & $module {
+        $controlCharacters = -join @(
+            [char]8,
+            [char]9,
+            [char]10,
+            [char]12,
+            [char]13,
+            [char]34,
+            [char]92,
+            [char]0,
+            [char]127
+        )
+        [pscustomobject]@{
+            WindowsPath = ConvertTo-CxTomlString `
+                'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+            Controls = ConvertTo-CxTomlString $controlCharacters
+        }
+    }
+    Assert-Equal `
+        -Actual $tomlStringResult.WindowsPath `
+        -Expected '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"' `
+        -Message 'TOML string escapes Windows path separators exactly once'
+    Assert-Equal `
+        -Actual $tomlStringResult.Controls `
+        -Expected '"\b\t\n\f\r\"\\\u0000\u007F"' `
+        -Message 'TOML string escapes special characters exactly once'
+
     $catalogPath = Join-Path `
         ([IO.Path]::GetTempPath()) `
         'cx-tests\openrouter-model-catalog.json'
-    $authCommand = if ($IsWindows) {
-        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    }
-    else { '/usr/bin/pwsh' }
+    $authCommand = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
     $tomlInput = @'
 model = "old/default"
 model_reasoning_effort = "high"
@@ -237,6 +261,11 @@ keep_tooling = "yes"
             'base_url = "https://openrouter.ai/api/v1"'
         ) `
         -Message 'OpenRouter TOML writes the current provider'
+    Assert-True `
+        -Condition $tomlResult.OpenRouter.Contains(
+            "command = $($tomlStringResult.WindowsPath)"
+        ) `
+        -Message 'OpenRouter TOML writes a valid Windows auth command path'
     Assert-True `
         -Condition $tomlResult.OpenRouter.Contains(
             "model = `"$openRouterModel`""

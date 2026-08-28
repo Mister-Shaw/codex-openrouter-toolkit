@@ -48,19 +48,21 @@ function ConvertTo-CxTomlString {
     foreach ($character in $Value.ToCharArray()) {
         $code = [int]$character
         switch ($code) {
-            8 { [void]$builder.Append('\b'); continue }
-            9 { [void]$builder.Append('\t'); continue }
-            10 { [void]$builder.Append('\n'); continue }
-            12 { [void]$builder.Append('\f'); continue }
-            13 { [void]$builder.Append('\r'); continue }
-            34 { [void]$builder.Append('\"'); continue }
-            92 { [void]$builder.Append('\\'); continue }
-        }
-        if ($code -lt 32 -or $code -eq 127) {
-            [void]$builder.Append(('\u{0:X4}' -f $code))
-        }
-        else {
-            [void]$builder.Append($character)
+            8 { [void]$builder.Append('\b') }
+            9 { [void]$builder.Append('\t') }
+            10 { [void]$builder.Append('\n') }
+            12 { [void]$builder.Append('\f') }
+            13 { [void]$builder.Append('\r') }
+            34 { [void]$builder.Append('\"') }
+            92 { [void]$builder.Append('\\') }
+            default {
+                if ($code -lt 32 -or $code -eq 127) {
+                    [void]$builder.Append(('\u{0:X4}' -f $code))
+                }
+                else {
+                    [void]$builder.Append($character)
+                }
+            }
         }
     }
     [void]$builder.Append('"')
