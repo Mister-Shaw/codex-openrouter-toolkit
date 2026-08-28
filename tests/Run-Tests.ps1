@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.2' `
+        -Expected '0.1.3' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -323,7 +323,7 @@ keep_tooling = "yes"
         [pscustomobject]@{
             Converted = $converted
             ConvertedAgain = Convert-CxCatalogPrompt -Content $converted
-            Prompt = $script:LightweightPrompt
+            Instructions = $script:EmptyInstructions
         }
     } $catalogInput
     $convertedCatalog = $catalogResult.Converted | ConvertFrom-Json
@@ -348,15 +348,31 @@ keep_tooling = "yes"
         -Expected 'preview' `
         -Message 'Catalog preserves unknown nested model data'
     foreach ($model in @($convertedCatalog.models)) {
+        Assert-True `
+            -Condition ($null -ne $model.PSObject.Properties['base_instructions']) `
+            -Message "Catalog keeps base_instructions present: $($model.slug)"
+        Assert-True `
+            -Condition ($model.base_instructions -is [string]) `
+            -Message "Catalog keeps base_instructions as a string: $($model.slug)"
         Assert-Equal `
             -Actual ([string]$model.base_instructions) `
-            -Expected $catalogResult.Prompt `
-            -Message "Catalog rewrites base_instructions: $($model.slug)"
+            -Expected $catalogResult.Instructions `
+            -Message "Catalog clears base_instructions: $($model.slug)"
+        Assert-True `
+            -Condition ($null -ne $model.model_messages.PSObject.Properties['instructions_template']) `
+            -Message "Catalog keeps instructions_template present: $($model.slug)"
+        Assert-True `
+            -Condition ($model.model_messages.instructions_template -is [string]) `
+            -Message "Catalog keeps instructions_template as a string: $($model.slug)"
         Assert-Equal `
             -Actual ([string]$model.model_messages.instructions_template) `
-            -Expected $catalogResult.Prompt `
-            -Message "Catalog rewrites instructions_template: $($model.slug)"
+            -Expected $catalogResult.Instructions `
+            -Message "Catalog clears instructions_template: $($model.slug)"
     }
+    Assert-Equal `
+        -Actual $catalogResult.Instructions `
+        -Expected '' `
+        -Message 'Catalog replacement instructions are empty'
     Assert-Equal `
         -Actual $catalogResult.ConvertedAgain `
         -Expected $catalogResult.Converted `

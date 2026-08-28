@@ -4,7 +4,7 @@ $script:MaximumConfigBytes = 5MB
 $script:MaximumCatalogBytes = 50MB
 $script:ManagedBlockBegin = '# BEGIN CodexOpenRouter managed provider'
 $script:ManagedBlockEnd = '# END CodexOpenRouter managed provider'
-$script:LightweightPrompt = "You are a general-purpose AI assistant with optional agent tools. Let the user's requested language, tone, structure, and level of detail guide the response. Follow higher-priority instructions and applicable AGENTS.md rules. For requests to answer, explain, review, diagnose, plan, or report status, inspect relevant materials and report findings without changing state. For requests to change, build, or fix, make only the requested in-scope changes. Use only the tools provided in this run and follow their schemas exactly. Use tools when they materially help; answer ordinary questions and writing tasks directly when tools add no value. Stay within granted permissions and the user's authorized scope. Ask before destructive or hard-to-reverse actions, external writes or messages, purchases, credential changes, or material scope expansion. Preserve existing work and unrelated changes; do not overwrite user edits. Use apply_patch for file edits when available. Briefly announce meaningful tool actions without routine narration. After changes, run relevant non-destructive validation when practical. Treat tool results as evidence and never claim an action, approval, edit, test, or outcome occurred unless it did. Continue until the requested outcome is genuinely handled, then report the result, validation, limitations, and remaining blockers clearly."
+$script:EmptyInstructions = ''
 
 function Assert-CxRuntime {
     if (-not $IsWindows) {
@@ -600,7 +600,7 @@ function Convert-CxCatalogPrompt {
         if ($slug -notmatch '^[^\s\x00-\x1F]{1,256}$') { throw '模型目录包含无效 slug。' }
         if (-not $slugs.Add($slug)) { throw "模型目录包含重复 slug：$slug" }
 
-        Set-CxObjectProperty -Object $model -Name 'base_instructions' -Value $script:LightweightPrompt
+        Set-CxObjectProperty -Object $model -Name 'base_instructions' -Value $script:EmptyInstructions
         $messagesProperty = $model.PSObject.Properties['model_messages']
         if ($null -eq $messagesProperty -or $null -eq $messagesProperty.Value -or
             $messagesProperty.Value -isnot [pscustomobject]) {
@@ -608,7 +608,7 @@ function Convert-CxCatalogPrompt {
             Set-CxObjectProperty -Object $model -Name 'model_messages' -Value $messages
         }
         else { $messages = $messagesProperty.Value }
-        Set-CxObjectProperty -Object $messages -Name 'instructions_template' -Value $script:LightweightPrompt
+        Set-CxObjectProperty -Object $messages -Name 'instructions_template' -Value $script:EmptyInstructions
     }
 
     $json = $catalog | ConvertTo-Json -Depth 100 -Compress
@@ -618,11 +618,25 @@ function Convert-CxCatalogPrompt {
     }
     $verified = $json | ConvertFrom-Json -ErrorAction Stop
     $verifiedModels = @($verified.models)
-    if ($verifiedModels.Count -ne $models.Count -or @($verifiedModels | Where-Object {
-            $_.base_instructions -cne $script:LightweightPrompt -or
-            $_.model_messages.instructions_template -cne $script:LightweightPrompt
-        }).Count -ne 0) {
-        throw '轻量系统提示改写校验失败。'
+    $invalidModels = @($verifiedModels | Where-Object {
+        $baseProperty = $_.PSObject.Properties['base_instructions']
+        $messagesProperty = $_.PSObject.Properties['model_messages']
+        $templateProperty = if ($null -eq $messagesProperty -or
+            $null -eq $messagesProperty.Value) {
+            $null
+        }
+        else {
+            $messagesProperty.Value.PSObject.Properties['instructions_template']
+        }
+        $null -eq $baseProperty -or
+        $baseProperty.Value -isnot [string] -or
+        $baseProperty.Value -cne $script:EmptyInstructions -or
+        $null -eq $templateProperty -or
+        $templateProperty.Value -isnot [string] -or
+        $templateProperty.Value -cne $script:EmptyInstructions
+    })
+    if ($verifiedModels.Count -ne $models.Count -or $invalidModels.Count -ne 0) {
+        throw '模型基础指令清空校验失败。'
     }
     return $json
 }

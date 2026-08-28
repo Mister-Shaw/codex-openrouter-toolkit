@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 - 2026-08-28
+
+- 删除模块内嵌的 1,362 字符轻量 Agent 提示。
+- `cxor` 将每个模型的 `base_instructions` 与 `model_messages.instructions_template` 明确写为空字符串。
+- 加强目录测试，分别验证两个指令字段存在、值为空并保持幂等。
+- 补充说明 Codex Desktop 的 developer 上下文、工具定义、Skills 和权限控制仍会继续注入。
+
 ## 0.1.2 - 2026-08-27
 
 - 修复 TOML 字符串编码器重复追加转义字符，导致 Windows 路径生成 `\\\` 并使 `cxor` 同步失败的问题。
