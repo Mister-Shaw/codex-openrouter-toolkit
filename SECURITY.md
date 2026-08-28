@@ -1,5 +1,7 @@
 # 安全政策
 
+**简体中文** | [English](SECURITY_EN.md)
+
 ## 支持版本
 
 安全修复只面向当前版本 `0.1.7`。旧版本用户应先更新，再确认问题是否仍然存在。
@@ -14,7 +16,7 @@
 
 ## 网络与模型
 
-- 每次运行 `cxor` 都会连接 OpenRouter，按当前 Codex CLI 版本同步最新 Codex 专用模型信息，并生成和验证本地模型目录。
+- 每次运行 `cxor` 都会连接 OpenRouter，按当前 Codex CLI 版本尝试同步最新 Codex 专用模型信息，并生成和验证本地模型目录。
 - 新目录必须包含官方入口 `~openai/gpt-latest`，缺失时会在发布前拒绝。
 - OpenRouter 模式下，对话请求会经过 OpenRouter，并可能发送给所选模型的下游供应商。请按所选供应商的数据政策处理敏感内容。
 - 工具包会把目录内每个模型的 `base_instructions` 与 `model_messages.instructions_template` 写为空字符串。Codex Desktop 仍会提供 developer 上下文、工具定义和权限控制；不同模型对 Responses API 和工具调用的支持程度仍有差异。
