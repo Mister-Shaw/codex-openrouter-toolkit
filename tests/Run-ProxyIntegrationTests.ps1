@@ -69,7 +69,8 @@ function New-ProxyRequest {
         [string]$Method = 'POST',
         [string]$Path = '/api/v1/responses',
         [AllowNull()][string]$Body,
-        [AllowNull()][string]$Token = $script:LocalTestToken
+        [AllowNull()][string]$Token = $script:LocalTestToken,
+        [AllowNull()][string]$SessionId
     )
 
     $request = [Net.Http.HttpRequestMessage]::new(
@@ -78,6 +79,9 @@ function New-ProxyRequest {
     )
     if (-not [string]::IsNullOrEmpty($Token)) {
         [void]$request.Headers.TryAddWithoutValidation('x-cxor-proxy-token', $Token)
+    }
+    if (-not [string]::IsNullOrEmpty($SessionId)) {
+        [void]$request.Headers.TryAddWithoutValidation('x-session-id', $SessionId)
     }
     if ($Method -ceq 'POST') {
         [void]$request.Headers.TryAddWithoutValidation(
@@ -99,10 +103,11 @@ function Invoke-BufferedProxyRequest {
         [string]$Method = 'POST',
         [string]$Path = $script:ResponsePath,
         [AllowNull()][string]$Body = $script:ValidRequestBody,
-        [AllowNull()][string]$Token = $script:LocalTestToken
+        [AllowNull()][string]$Token = $script:LocalTestToken,
+        [AllowNull()][string]$SessionId
     )
 
-    $request = New-ProxyRequest -Method $Method -Path $Path -Body $Body -Token $Token
+    $request = New-ProxyRequest -Method $Method -Path $Path -Body $Body -Token $Token -SessionId $SessionId
     $response = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $deadline = [Threading.CancellationTokenSource]::new(
@@ -158,7 +163,7 @@ try {
     $module = Get-Module CodexOpenRouter -ErrorAction Stop
     & $module { Initialize-CxProxyType }
 
-    if (-not ('CodexOpenRouter.IntegrationTests.OfflineUpstreamHandlerV3' -as [type])) {
+    if (-not ('CodexOpenRouter.IntegrationTests.OfflineUpstreamHandlerV4' -as [type])) {
         Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Concurrent;
@@ -172,7 +177,7 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter.IntegrationTests
 {
-    public static class FixturesV3
+    public static class FixturesV4
     {
         public const string PromptSentinel = "OFFLINE_PROMPT_SENTINEL";
         public const string QuerySentinel = "OFFLINE_QUERY_SENTINEL";
@@ -186,9 +191,15 @@ namespace CodexOpenRouter.IntegrationTests
             "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
         public const string FailingSsePrefix =
             "event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n";
+        public const string ClaudeHitSse =
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10000,\"input_tokens_details\":{\"cached_tokens\":9000,\"cache_write_tokens\":500},\"output_tokens\":20,\"cost\":0.0123}}}\n\n";
+        public const string ClaudeWriteJson =
+            "{\"status\":\"completed\",\"usage\":{\"input_tokens\":10000,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":9500},\"output_tokens\":15,\"cost\":0.02}}";
+        public const string ClaudeMissJson =
+            "{\"status\":\"completed\",\"usage\":{\"input_tokens\":10000,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"output_tokens\":10,\"cost\":0.05}}";
     }
 
-    public sealed class ObservedRequestV3
+    public sealed class ObservedRequestV4
     {
         public string Method { get; set; }
         public string Scheme { get; set; }
@@ -200,9 +211,11 @@ namespace CodexOpenRouter.IntegrationTests
         public string ContentType { get; set; }
         public bool HasLocalTokenHeader { get; set; }
         public bool ContainsLocalToken { get; set; }
+        public string SessionId { get; set; }
+        public string Body { get; set; }
     }
 
-    public sealed class BodyProbeV3
+    public sealed class BodyProbeV4
     {
         private int reads;
         private int cancellations;
@@ -212,16 +225,16 @@ namespace CodexOpenRouter.IntegrationTests
         internal void Cancelled() { Interlocked.Increment(ref cancellations); }
     }
 
-    public sealed class FixtureBodyStreamV3 : Stream
+    public sealed class FixtureBodyStreamV4 : Stream
     {
         private readonly byte[] bytes;
         private readonly string mode;
-        private readonly BodyProbeV3 probe;
+        private readonly BodyProbeV4 probe;
         private readonly TaskCompletionSource<bool> failureGate =
             new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private int position;
 
-        public FixtureBodyStreamV3(byte[] bytes, string mode, BodyProbeV3 probe)
+        public FixtureBodyStreamV4(byte[] bytes, string mode, BodyProbeV4 probe)
         {
             this.bytes = bytes;
             this.mode = mode;
@@ -265,7 +278,7 @@ namespace CodexOpenRouter.IntegrationTests
             if (mode == "fail_after_prefix")
             {
                 await failureGate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-                throw new IOException(FixturesV3.ExceptionSentinel);
+                throw new IOException(FixturesV4.ExceptionSentinel);
             }
             return 0;
         }
@@ -282,19 +295,19 @@ namespace CodexOpenRouter.IntegrationTests
         public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     }
 
-    public sealed class FixtureContentV3 : HttpContent
+    public sealed class FixtureContentV4 : HttpContent
     {
         private readonly byte[] bytes;
         private readonly bool knownLength;
-        private readonly FixtureBodyStreamV3 bodyStream;
-        public BodyProbeV3 Probe { get; private set; }
+        private readonly FixtureBodyStreamV4 bodyStream;
+        public BodyProbeV4 Probe { get; private set; }
 
-        public FixtureContentV3(string body, string mediaType, bool knownLength, string mode)
+        public FixtureContentV4(string body, string mediaType, bool knownLength, string mode)
         {
             bytes = Encoding.UTF8.GetBytes(body);
             this.knownLength = knownLength;
-            Probe = new BodyProbeV3();
-            bodyStream = new FixtureBodyStreamV3(bytes, mode, Probe);
+            Probe = new BodyProbeV4();
+            bodyStream = new FixtureBodyStreamV4(bytes, mode, Probe);
             Headers.ContentType = new MediaTypeHeaderValue(mediaType);
         }
 
@@ -319,23 +332,23 @@ namespace CodexOpenRouter.IntegrationTests
         }
     }
 
-    public sealed class OfflineUpstreamHandlerV3 : HttpMessageHandler
+    public sealed class OfflineUpstreamHandlerV4 : HttpMessageHandler
     {
         private readonly string localToken;
         private readonly ConcurrentQueue<string> scenarios = new ConcurrentQueue<string>();
-        private readonly ConcurrentQueue<ObservedRequestV3> observations =
-            new ConcurrentQueue<ObservedRequestV3>();
+        private readonly ConcurrentQueue<ObservedRequestV4> observations =
+            new ConcurrentQueue<ObservedRequestV4>();
         private int requestCount;
         public int RequestCount { get { return Volatile.Read(ref requestCount); } }
         public int PendingScenarioCount { get { return scenarios.Count; } }
-        public FixtureContentV3 LastContent { get; private set; }
+        public FixtureContentV4 LastContent { get; private set; }
 
-        public OfflineUpstreamHandlerV3(string localToken) { this.localToken = localToken; }
+        public OfflineUpstreamHandlerV4(string localToken) { this.localToken = localToken; }
         public void Enqueue(string scenario) { scenarios.Enqueue(scenario); }
-        public ObservedRequestV3[] GetObservations() { return observations.ToArray(); }
+        public ObservedRequestV4[] GetObservations() { return observations.ToArray(); }
         public void ReleaseStreamFailure()
         {
-            FixtureContentV3 content = LastContent;
+            FixtureContentV4 content = LastContent;
             if (content != null) content.ReleaseFailure();
         }
 
@@ -347,7 +360,7 @@ namespace CodexOpenRouter.IntegrationTests
                 await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
             string allHeaders = request.Headers.ToString() +
                 (request.Content == null ? string.Empty : request.Content.Headers.ToString());
-            observations.Enqueue(new ObservedRequestV3
+            observations.Enqueue(new ObservedRequestV4
             {
                 Method = request.Method.Method,
                 Scheme = request.RequestUri.Scheme,
@@ -362,7 +375,10 @@ namespace CodexOpenRouter.IntegrationTests
                 HasLocalTokenHeader = request.Headers.Contains("x-cxor-proxy-token") ||
                     (request.Content != null && request.Content.Headers.Contains("x-cxor-proxy-token")),
                 ContainsLocalToken = allHeaders.Contains(localToken) || body.Contains(localToken) ||
-                    request.RequestUri.AbsoluteUri.Contains(localToken)
+                    request.RequestUri.AbsoluteUri.Contains(localToken),
+                SessionId = request.Headers.Contains("x-session-id") ?
+                    string.Join(",", request.Headers.GetValues("x-session-id")) : string.Empty,
+                Body = body
             });
 
             // A strict fake makes any unexpected production request fail offline.
@@ -375,7 +391,7 @@ namespace CodexOpenRouter.IntegrationTests
                 throw new InvalidOperationException("No offline response fixture was queued.");
             LastContent = null;
             if (scenario == "send_failure")
-                throw new HttpRequestException(FixturesV3.ExceptionSentinel);
+                throw new HttpRequestException(FixturesV4.ExceptionSentinel);
 
             int status = 200;
             string text = string.Empty;
@@ -390,17 +406,17 @@ namespace CodexOpenRouter.IntegrationTests
                 case "json502":
                     status = 502;
                     text = "{\"error\":{\"message\":\"" +
-                        FixturesV3.UpstreamBodySentinel + "\"}}";
+                        FixturesV4.UpstreamBodySentinel + "\"}}";
                     break;
                 case "known401":
                     status = 401;
-                    text = "{\"error\":{\"message\":\"" + FixturesV3.Known401Message +
+                    text = "{\"error\":{\"message\":\"" + FixturesV4.Known401Message +
                         "\",\"type\":\"authentication_error\",\"code\":\"invalid_api_key\"}}";
                     break;
                 case "unknown401":
                     status = 401;
                     knownLength = false;
-                    text = "{\"error\":{\"message\":\"" + FixturesV3.Unknown401Message +
+                    text = "{\"error\":{\"message\":\"" + FixturesV4.Unknown401Message +
                         "\",\"type\":\"authentication_error\",\"code\":\"chunked_test\"}}";
                     break;
                 case "hanging429":
@@ -411,18 +427,33 @@ namespace CodexOpenRouter.IntegrationTests
                 case "sse":
                     knownLength = false;
                     mediaType = "text/event-stream";
-                    text = FixturesV3.NormalSse;
+                    text = FixturesV4.NormalSse;
                     break;
                 case "sse_failure":
                     knownLength = false;
                     mediaType = "text/event-stream";
-                    text = FixturesV3.FailingSsePrefix;
+                    text = FixturesV4.FailingSsePrefix;
                     mode = "fail_after_prefix";
+                    break;
+                case "claude_hit":
+                    knownLength = false;
+                    mediaType = "text/event-stream";
+                    text = FixturesV4.ClaudeHitSse;
+                    break;
+                case "claude_write":
+                    text = FixturesV4.ClaudeWriteJson;
+                    break;
+                case "claude_miss":
+                    text = FixturesV4.ClaudeMissJson;
+                    break;
+                case "claude_rejected":
+                    status = 402;
+                    text = "{\"error\":{\"message\":\"Synthetic insufficient credit.\",\"code\":402}}";
                     break;
                 default:
                     throw new InvalidOperationException("Unknown offline response fixture.");
             }
-            LastContent = new FixtureContentV3(text, mediaType, knownLength, mode);
+            LastContent = new FixtureContentV4(text, mediaType, knownLength, mode);
             var response = new HttpResponseMessage((HttpStatusCode)status)
             {
                 Content = LastContent,
@@ -442,10 +473,10 @@ namespace CodexOpenRouter.IntegrationTests
     $script:LocalTestToken = 'A' * 64
     $script:SyntheticApiKey = 'offline-api-key-fixture-never-valid'
     $script:ResponsePath = '/api/v1/responses?fixture=' +
-        [CodexOpenRouter.IntegrationTests.FixturesV3]::QuerySentinel
+        [CodexOpenRouter.IntegrationTests.FixturesV4]::QuerySentinel
     $script:ValidRequestBody = [ordered]@{
         model = 'openai/offline-integration-test'
-        input = [CodexOpenRouter.IntegrationTests.FixturesV3]::PromptSentinel
+        input = [CodexOpenRouter.IntegrationTests.FixturesV4]::PromptSentinel
         stream = $true
     } | ConvertTo-Json -Compress
 
@@ -458,9 +489,9 @@ namespace CodexOpenRouter.IntegrationTests
     $script:ProxyBaseUrl = "http://127.0.0.1:$port"
 
     $flags = [Reflection.BindingFlags]'Instance,NonPublic'
-    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV3]
+    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV4]
     $serverType = $proxyType.GetNestedType('ProxyServer', [Reflection.BindingFlags]::NonPublic)
-    if ($null -eq $serverType) { throw 'The V3 private ProxyServer test seam is unavailable.' }
+    if ($null -eq $serverType) { throw 'The V4 private ProxyServer test seam is unavailable.' }
     $server = [Activator]::CreateInstance(
         $serverType,
         $flags,
@@ -470,7 +501,7 @@ namespace CodexOpenRouter.IntegrationTests
     )
     $clientField = $serverType.GetField('client', $flags)
     $originalClient = $clientField.GetValue($server)
-    $upstreamHandler = [CodexOpenRouter.IntegrationTests.OfflineUpstreamHandlerV3]::new(
+    $upstreamHandler = [CodexOpenRouter.IntegrationTests.OfflineUpstreamHandlerV4]::new(
         $script:LocalTestToken
     )
     $offlineClient = [Net.Http.HttpClient]::new($upstreamHandler)
@@ -493,16 +524,18 @@ namespace CodexOpenRouter.IntegrationTests
     $downstreamClient.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     $script:DownstreamClient = $downstreamClient
 
-    Invoke-TestCase 'Initial health uses the V3 schema without an upstream request' {
+    Invoke-TestCase 'Initial health uses the V4 schema without an upstream request' {
         $result = Invoke-BufferedProxyRequest -Method GET -Path '/__cxor/health' -Body $null
         try {
             $health = $result.Text | ConvertFrom-Json
             Assert-Equal ([int]$result.Response.StatusCode) 200 'Initial health is reachable'
             Assert-Equal $health.status 'ok' 'Initial health status'
-            Assert-Equal $health.schema 3 'Initial health schema'
+            Assert-Equal $health.schema 4 'Initial health schema'
             Assert-Equal $health.pid $PID 'Health identifies the in-process test server'
             Assert-Equal $health.total_requests 0 'Health does not count as inference traffic'
             Assert-Equal $health.total_failures 0 'Initial failure counter'
+            Assert-Equal $health.claude_cache.requests 0 'Initial Claude cache counter'
+            Assert-True ($null -eq $health.claude_cache.last) 'Initial Claude cache evidence is absent'
             Assert-Equal $upstreamHandler.RequestCount 0 'Health stays on loopback'
         }
         finally { $result.Response.Dispose() }
@@ -529,7 +562,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal $upstreamHandler.LastContent.Probe.ReadCalls 0 `
                 'A populated 5xx body is skipped'
             Assert-True (-not $result.Text.Contains(
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::UpstreamBodySentinel
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::UpstreamBodySentinel
             )) 'The unreliable 5xx body is absent from the response'
             Assert-Equal (Get-ResponseHeader $result.Response 'x-request-id') `
                 'offline-request-id' 'A safe upstream request identifier is preserved'
@@ -544,7 +577,7 @@ namespace CodexOpenRouter.IntegrationTests
         $result = Invoke-BufferedProxyRequest
         try {
             Assert-JsonError $result 401 'upstream' 'upstream_http_401' `
-                ([CodexOpenRouter.IntegrationTests.FixturesV3]::Known401Message) `
+                ([CodexOpenRouter.IntegrationTests.FixturesV4]::Known401Message) `
                 'invalid_api_key'
             Assert-True ($upstreamHandler.LastContent.Probe.ReadCalls -gt 0) `
                 'The known small 4xx body is read'
@@ -557,7 +590,7 @@ namespace CodexOpenRouter.IntegrationTests
         $result = Invoke-BufferedProxyRequest
         try {
             Assert-JsonError $result 401 'upstream' 'upstream_http_401' `
-                ([CodexOpenRouter.IntegrationTests.FixturesV3]::Unknown401Message) `
+                ([CodexOpenRouter.IntegrationTests.FixturesV4]::Unknown401Message) `
                 'chunked_test'
             Assert-True ($null -eq $upstreamHandler.LastContent.Headers.ContentLength) `
                 'The fixture has no upstream Content-Length'
@@ -616,7 +649,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-JsonError $result 502 'local' 'send_upstream' `
                 'Local OpenRouter proxy failed at send_upstream.' 'send_upstream'
             Assert-True (-not $result.Text.Contains(
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::ExceptionSentinel
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::ExceptionSentinel
             )) 'A local exception detail is absent from the error body'
         }
         finally { $result.Response.Dispose() }
@@ -629,7 +662,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal ([int]$result.Response.StatusCode) 200 'SSE HTTP status'
             Assert-Equal $result.Response.Content.Headers.ContentType.MediaType `
                 'text/event-stream' 'SSE content type survives restricted-header handling'
-            Assert-Equal $result.Text ([CodexOpenRouter.IntegrationTests.FixturesV3]::NormalSse) `
+            Assert-Equal $result.Text ([CodexOpenRouter.IntegrationTests.FixturesV4]::NormalSse) `
                 'All SSE bytes arrive unchanged'
             Assert-True ($result.Response.Headers.TransferEncodingChunked -eq $true) `
                 'The downstream SSE response is chunked'
@@ -657,7 +690,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal ([int]$response.StatusCode) 200 'The SSE response starts successfully'
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $expected = [Text.Encoding]::UTF8.GetBytes(
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::FailingSsePrefix
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::FailingSsePrefix
             )
             $received = [byte[]]::new($expected.Length)
             $offset = 0
@@ -672,7 +705,7 @@ namespace CodexOpenRouter.IntegrationTests
                 $offset += $read
             }
             Assert-Equal ([Text.Encoding]::UTF8.GetString($received)) `
-                ([CodexOpenRouter.IntegrationTests.FixturesV3]::FailingSsePrefix) `
+                ([CodexOpenRouter.IntegrationTests.FixturesV4]::FailingSsePrefix) `
                 'The first SSE event is visible before the failure is released'
             $upstreamHandler.ReleaseStreamFailure()
             $streamFailure = $null
@@ -705,14 +738,15 @@ namespace CodexOpenRouter.IntegrationTests
             $allowed = @(
                 'status', 'schema', 'pid', 'total_requests', 'total_failures',
                 'last_error_source', 'last_error_code', 'last_error_phase',
-                'last_upstream_status', 'last_request_bytes', 'last_error_utc'
+                'last_upstream_status', 'last_request_bytes', 'last_error_utc', 'claude_cache'
             ) | Sort-Object
             $actual = @($health.PSObject.Properties.Name | Sort-Object)
             Assert-Equal ($actual -join ',') ($allowed -join ',') `
                 'Health fields exactly match the safe allowlist'
-            Assert-Equal $health.schema 3 'Diagnostics retain the V3 schema'
+            Assert-Equal $health.schema 4 'Diagnostics retain the V4 schema'
             Assert-Equal $health.total_requests 9 'Only authenticated Responses requests are counted'
             Assert-Equal $health.total_failures 8 'Each failed request is counted once'
+            Assert-Equal $health.claude_cache.requests 0 'Other models never populate Claude counters'
             Assert-Equal $health.last_error_source 'local' 'Latest failure source is local'
             Assert-Equal $health.last_error_code 'read_upstream' 'Latest failure code is the read phase'
             Assert-Equal $health.last_error_phase 'read_upstream' 'Latest failure phase is stable'
@@ -726,10 +760,10 @@ namespace CodexOpenRouter.IntegrationTests
             foreach ($sentinel in @(
                 $script:LocalTestToken,
                 $script:SyntheticApiKey,
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::PromptSentinel,
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::QuerySentinel,
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::UpstreamBodySentinel,
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::ExceptionSentinel
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::PromptSentinel,
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::QuerySentinel,
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::UpstreamBodySentinel,
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::ExceptionSentinel
             )) {
                 Assert-True (-not $result.Text.Contains($sentinel)) `
                     'Health excludes credential, prompt, query, body, and exception sentinels'
@@ -748,7 +782,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal $observed.Host 'openrouter.ai' 'Production upstream host remains fixed'
             Assert-Equal $observed.Path '/api/v1/responses' 'Production upstream path remains fixed'
             Assert-Equal $observed.Query ('?fixture=' +
-                [CodexOpenRouter.IntegrationTests.FixturesV3]::QuerySentinel) `
+                [CodexOpenRouter.IntegrationTests.FixturesV4]::QuerySentinel) `
                 'The synthetic query is forwarded without changing the target'
             Assert-True (-not $observed.HasLocalTokenHeader) 'The local-token header is stripped'
             Assert-True (-not $observed.ContainsLocalToken) 'The local token never reaches upstream data'
@@ -757,6 +791,161 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal $observed.AcceptEncoding 'identity' 'Upstream compression is pinned to identity'
             Assert-Equal $observed.ContentType 'application/json' 'Upstream content type remains JSON'
         }
+    }
+
+    $claudeBody = '{"model":"anthropic/claude-opus-5","instructions":"OFFLINE_INSTRUCTIONS_SENTINEL","input":[{"role":"system","content":"OFFLINE_SYSTEM_SENTINEL"},{"role":"user","content":"OFFLINE_USER_SENTINEL"}],"stream":true}'
+    $expectedClaudeRequests = 0
+    foreach ($case in @(
+        @{ Scenario = 'claude_hit'; Status = 'hit'; CountField = 'hit_requests'; Http = 200; Body = [CodexOpenRouter.IntegrationTests.FixturesV4]::ClaudeHitSse },
+        @{ Scenario = 'claude_write'; Status = 'write'; CountField = 'write_requests'; Http = 200; Body = [CodexOpenRouter.IntegrationTests.FixturesV4]::ClaudeWriteJson },
+        @{ Scenario = 'claude_miss'; Status = 'miss'; CountField = 'miss_requests'; Http = 200; Body = [CodexOpenRouter.IntegrationTests.FixturesV4]::ClaudeMissJson },
+        @{ Scenario = 'sse'; Status = 'unknown'; CountField = 'unknown_requests'; Http = 200; Body = [CodexOpenRouter.IntegrationTests.FixturesV4]::NormalSse },
+        @{ Scenario = 'claude_rejected'; Status = 'rejected'; CountField = 'rejected_requests'; Http = 402; Body = $null }
+    )) {
+        $expectedClaudeRequests++
+        Invoke-TestCase "Claude $($case.Status) accounting is observable without changing response bytes" {
+            $upstreamHandler.Enqueue($case.Scenario)
+            $result = Invoke-BufferedProxyRequest -Body $claudeBody
+            try {
+                Assert-Equal ([int]$result.Response.StatusCode) $case.Http 'Claude response status survives observation'
+                if ($null -ne $case.Body) {
+                    Assert-Equal $result.Text $case.Body 'Claude response bytes survive observation unchanged'
+                }
+                else {
+                    $errorBody = $result.Text | ConvertFrom-Json
+                    Assert-Equal $errorBody.error.message 'Synthetic insufficient credit.' 'Credit rejection message is retained'
+                }
+            }
+            finally { $result.Response.Dispose() }
+
+            # Response completion and finally-based accounting can race. Only poll
+            # the local health endpoint, with a short bounded deadline.
+            $health = $null
+            for ($attempt = 0; $attempt -lt 100; $attempt++) {
+                $healthResult = Invoke-BufferedProxyRequest -Method GET -Path '/__cxor/health' -Body $null
+                try { $health = $healthResult.Text | ConvertFrom-Json }
+                finally { $healthResult.Response.Dispose() }
+                if ($health.claude_cache.requests -eq $expectedClaudeRequests) { break }
+                [Threading.Thread]::Sleep(10)
+            }
+            Assert-Equal $health.claude_cache.requests $expectedClaudeRequests 'Each completed Claude request is counted once'
+            Assert-Equal $health.claude_cache.($case.CountField) 1 'The corresponding cache result counter increments once'
+            Assert-Equal $health.claude_cache.last.status $case.Status 'Last result accurately reports the cache outcome'
+            Assert-Equal $health.claude_cache.last.http_status $case.Http 'Last cache result retains upstream HTTP status'
+            Assert-Equal $health.claude_cache.last.policy 'system_prefix' 'Last cache result identifies automatic prefix policy'
+            Assert-Equal $health.claude_cache.last.system_cache_coverage 'unknown' 'Aggregate usage does not claim exact prefix coverage'
+            Assert-True (-not [string]::IsNullOrWhiteSpace($health.claude_cache.last.observed_utc)) 'Cache evidence has a timestamp'
+            $cacheFields = @('requests', 'hit_requests', 'write_requests', 'miss_requests', 'unknown_requests', 'rejected_requests', 'last') | Sort-Object
+            Assert-Equal (($health.claude_cache.PSObject.Properties.Name | Sort-Object) -join ',') ($cacheFields -join ',') `
+                'Claude summary has only the safe counter allowlist'
+            $lastFields = @('status', 'completion_status', 'usage_known', 'input_tokens', 'cached_tokens', 'cache_write_tokens', 'output_tokens', 'cost', 'system_cache_coverage', 'http_status', 'policy', 'observed_utc') | Sort-Object
+            Assert-Equal (($health.claude_cache.last.PSObject.Properties.Name | Sort-Object) -join ',') ($lastFields -join ',') `
+                'Claude details have only the safe accounting allowlist'
+            if ($case.Status -ceq 'hit') {
+                Assert-Equal $health.claude_cache.last.cached_tokens 9000 'Cached reads reach health accounting'
+                Assert-Equal $health.claude_cache.last.cache_write_tokens 500 'Concurrent writes are reported separately'
+                Assert-Equal $health.claude_cache.last.cost 0.0123 'Upstream reported cost reaches health accounting'
+            }
+            if ($case.Status -ceq 'rejected') {
+                Assert-Equal $health.claude_cache.last.completion_status 'rejected' 'HTTP rejection remains distinct from cache miss'
+                Assert-Equal $health.claude_cache.last.cost $null 'Rejected requests never invent zero cost'
+                Assert-Equal $health.claude_cache.miss_requests 1 'Credit rejection does not increment cache misses'
+            }
+            foreach ($sentinel in @($script:LocalTestToken, $script:SyntheticApiKey,
+                'OFFLINE_INSTRUCTIONS_SENTINEL', 'OFFLINE_SYSTEM_SENTINEL', 'OFFLINE_USER_SENTINEL')) {
+                Assert-True (-not $healthResult.Text.Contains($sentinel)) 'Cache health excludes credentials and prompt text'
+            }
+            $observed = @($upstreamHandler.GetObservations())[-1]
+            Assert-True ($observed.SessionId -cmatch '^cxor-claude-[0-9a-f]+$') 'Claude requests carry opaque stable routing'
+            Assert-True (-not $observed.ContainsLocalToken) 'Opaque routing cannot expose the local secret'
+            $requestJson = $observed.Body | ConvertFrom-Json
+            Assert-Equal $requestJson.input[0].content[0].prompt_cache_breakpoint.mode 'explicit' 'Actual forwarded request marks the stable system prefix'
+            Assert-Equal $requestJson.instructions 'OFFLINE_INSTRUCTIONS_SENTINEL' 'Forwarded instructions stay unchanged'
+        }
+    }
+
+    Invoke-TestCase 'Claude routing and cumulative results stay stable across repeated requests' {
+        $observations = @($upstreamHandler.GetObservations()) | Select-Object -Last 5
+        Assert-Equal (@($observations | Select-Object -ExpandProperty SessionId -Unique).Count) 1 `
+            'Identical model/system requests share the fallback route'
+        Assert-Equal $upstreamHandler.PendingScenarioCount 0 'All cache accounting fixtures were consumed'
+        Assert-Equal $upstreamHandler.RequestCount 13 'Only the expected offline requests reached the handler'
+    }
+
+    Invoke-TestCase 'Existing routing identities preserve body semantics and never leak Unicode into new headers' {
+        foreach ($case in @(
+            @{ Body = '{"model":"anthropic/claude-opus-5","prompt_cache_key":"离线缓存-🚀","input":[{"role":"system","content":"base"},{"role":"user","content":"hello"}]}'; Header = ''; ExpectedHeader = ''; Field = 'prompt_cache_key'; Expected = '离线缓存-🚀' },
+            @{ Body = '{"model":"anthropic/claude-opus-5","session_id":"caller-body-session","prompt_cache_key":"caller-cache","input":[{"role":"system","content":"base"}]}'; Header = ''; ExpectedHeader = ''; Field = 'session_id'; Expected = 'caller-body-session' },
+            @{ Body = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"}]}'; Header = 'caller-header-session'; ExpectedHeader = 'caller-header-session'; Field = $null; Expected = $null }
+        )) {
+            $upstreamHandler.Enqueue('claude_miss')
+            $result = Invoke-BufferedProxyRequest -Body $case.Body -SessionId $case.Header
+            try { Assert-Equal ([int]$result.Response.StatusCode) 200 'Existing routing identity cannot cause a local encoding failure' }
+            finally { $result.Response.Dispose() }
+            $observed = @($upstreamHandler.GetObservations())[-1]
+            Assert-Equal $observed.SessionId $case.ExpectedHeader 'Only an existing session header is forwarded'
+            $parsed = $observed.Body | ConvertFrom-Json
+            if ($null -ne $case.Field) {
+                Assert-Equal $parsed.($case.Field) $case.Expected 'Caller routing identity stays in the original JSON field'
+            }
+            else {
+                Assert-True ($null -eq $parsed.PSObject.Properties['session_id']) 'An existing header does not synthesize a body session'
+            }
+            Assert-Equal $parsed.cache_control.type 'ephemeral' 'Existing routing identity keeps automatic cache support'
+        }
+    }
+
+    Invoke-TestCase 'Caller cache policies reach the upstream byte-for-byte' {
+        $body = ' { "model" : "anthropic/claude-opus-5", "cache_control" : {"type":"ephemeral","ttl":"1h"}, "input" : [{"role":"system","content":"base"}] } '
+        $upstreamHandler.Enqueue('claude_miss')
+        $result = Invoke-BufferedProxyRequest -Body $body
+        try { Assert-Equal ([int]$result.Response.StatusCode) 200 'Explicit caller policy is accepted by forwarding' }
+        finally { $result.Response.Dispose() }
+        Assert-Equal (@($upstreamHandler.GetObservations())[-1].Body) $body 'Explicit caller request bytes stay unchanged'
+    }
+
+    Invoke-TestCase 'Public cache query reads local counters without creating upstream traffic' {
+        $before = $upstreamHandler.RequestCount
+        $query = & $module {
+            param([int]$TestPort, [string]$TestToken, [int]$TestPid)
+            $originals = @{}
+            foreach ($name in @('Assert-CxRuntime', 'Get-CxPaths', 'Get-CxProxyState', 'Test-CxProxyProcess')) {
+                $originals[$name] = (Get-Item -LiteralPath "Function:\$name").ScriptBlock
+            }
+            $script:OfflineCacheQueryState = [pscustomobject]@{
+                Schema = 4; Port = $TestPort; Token = $TestToken; ProcessId = $TestPid
+            }
+            try {
+                function script:Assert-CxRuntime { }
+                function script:Get-CxPaths { [pscustomobject]@{ ProxyStatePath = 'offline-no-file.json' } }
+                function script:Get-CxProxyState { param($StatePath) return $script:OfflineCacheQueryState }
+                function script:Test-CxProxyProcess { param($State) return $true }
+                for ($attempt = 0; $attempt -lt 100; $attempt++) {
+                    $status = cxor -CacheStatus
+                    if ($status.ClaudeRequests -eq 9) { return $status }
+                    [Threading.Thread]::Sleep(10)
+                }
+                return $status
+            }
+            finally {
+                foreach ($name in $originals.Keys) {
+                    Set-Item -LiteralPath "Function:\$name" -Value $originals[$name]
+                }
+                Remove-Variable -Scope Script -Name OfflineCacheQueryState -ErrorAction SilentlyContinue
+            }
+        } $port $script:LocalTestToken $PID
+        Assert-Equal $upstreamHandler.RequestCount $before 'Read-only status sends no model or catalog requests'
+        Assert-Equal $query.ClaudeRequests 9 'Public status includes every synthetic Claude request exactly once'
+        Assert-Equal $query.CacheHitRequests 1 'Public status retains hit counts'
+        Assert-Equal $query.CacheWriteRequests 1 'Public status retains write counts'
+        Assert-Equal $query.CacheMissRequests 5 'Public status retains miss counts'
+        Assert-Equal $query.RejectedRequests 1 'Public status keeps rejected requests separate'
+        Assert-Equal $query.UnknownRequests 1 'Public status retains unknown counts'
+        Assert-Equal $query.LastStatus 'miss' 'Public status reports the latest outcome'
+        Assert-Equal $query.Policy 'caller_policy' 'Public status distinguishes an explicit caller policy'
+        Assert-Equal $query.CacheReadPercent 0 'Public percentage is derived from reported input and cache-read counts'
+        Assert-Equal $query.CostUSD 0.05 'Public cost uses the upstream-reported value'
+        Assert-Equal $query.SystemCacheCoverage 'unknown' 'Public status avoids assuming which prefix tokens were cached'
     }
 
 }

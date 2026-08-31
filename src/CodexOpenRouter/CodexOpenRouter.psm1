@@ -539,7 +539,7 @@ function Commit-CxConfigChange {
 }
 
 function Initialize-CxProxyType {
-    if ('CodexOpenRouter.OpenRouterCacheProxyV3' -as [type]) { return }
+    if ('CodexOpenRouter.OpenRouterCacheProxyV4' -as [type]) { return }
 
     $source = @'
 using System;
@@ -556,7 +556,7 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter
 {
-    public static class OpenRouterCacheProxyV3
+    public static class OpenRouterCacheProxyV4
     {
         private const int MaximumRequestBytes = 64 * 1024 * 1024;
         private const int MaximumErrorResponseBytes = 1024 * 1024;
@@ -610,6 +610,11 @@ namespace CodexOpenRouter
                     MaxDepth = 128
                 });
             JsonObject request = root as JsonObject;
+            return RewriteRequestBody(body, request);
+        }
+
+        private static byte[] RewriteRequestBody(byte[] body, JsonObject request)
+        {
             if (request == null)
                 throw new JsonException("The Responses request must be a JSON object.");
 
@@ -621,14 +626,415 @@ namespace CodexOpenRouter
             try { model = modelNode.GetValue<string>(); }
             catch (InvalidOperationException) { return body; }
 
-            if (!IsClaudeModel(model) || request.ContainsKey("cache_control"))
+            // Explicit caller policies take precedence, including null opt-outs.
+            // Do not add an automatic slot to a caller's four explicit breakpoints.
+            if (!IsClaudeModel(model) || HasCachePolicy(request))
                 return body;
 
+            List<JsonObject> prefix = GetSystemPrefixMessages(request);
+            JsonObject first = null;
+            JsonObject last = null;
+            foreach (JsonObject message in prefix)
+            {
+                JsonObject block = GetLastSystemTextBlock(message, true);
+                if (block == null) continue;
+                if (first == null) first = block;
+                last = block;
+            }
+            if (first != null) AddSystemBreakpoint(first);
+            if (last != null && !ReferenceEquals(first, last)) AddSystemBreakpoint(last);
             request.Add(
                 "cache_control",
                 new JsonObject { ["type"] = "ephemeral" });
             return new UTF8Encoding(false).GetBytes(
-                root.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+                request.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+        }
+
+        private static bool HasCachePolicy(JsonObject request)
+        {
+            return request.ContainsKey("cache_control") ||
+                request.ContainsKey("prompt_cache_options") ||
+                ContainsCacheMarker(request["input"]) ||
+                ContainsCacheMarker(request["tools"]);
+        }
+
+        private static bool ContainsCacheMarker(JsonNode node)
+        {
+            JsonArray array = node as JsonArray;
+            if (array == null) return false;
+            foreach (JsonNode item in array)
+            {
+                JsonObject obj = item as JsonObject;
+                if (HasDirectCacheMarker(obj)) return true;
+                if (obj == null) continue;
+                // Inspect API content blocks only, never JSON Schema properties or
+                // arbitrary structured tool data that happens to use these names.
+                JsonArray content = obj["content"] as JsonArray;
+                if (content != null)
+                    foreach (JsonNode block in content)
+                        if (HasDirectCacheMarker(block as JsonObject)) return true;
+                if (ReadJsonString(obj, "type") == "function_call_output")
+                {
+                    JsonArray output = obj["output"] as JsonArray;
+                    if (output != null)
+                        foreach (JsonNode block in output)
+                            if (HasDirectCacheMarker(block as JsonObject)) return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool HasDirectCacheMarker(JsonObject obj)
+        {
+            return obj != null &&
+                (obj.ContainsKey("cache_control") || obj.ContainsKey("prompt_cache_breakpoint"));
+        }
+
+        private static List<JsonObject> GetSystemPrefixMessages(JsonObject request)
+        {
+            var result = new List<JsonObject>();
+            JsonArray input = request["input"] as JsonArray;
+            if (input == null) return result;
+            foreach (JsonNode item in input)
+            {
+                JsonObject message = item as JsonObject;
+                string role = ReadJsonString(message, "role");
+                string type = ReadJsonString(message, "type");
+                if (message == null || (type != null && type != "message") ||
+                    (role != "system" && role != "developer")) break;
+                if (!(message["content"] is JsonArray) &&
+                    ReadJsonString(message, "content") == null) break;
+                result.Add(message);
+            }
+            return result;
+        }
+
+        private static bool HasEligibleSystemPrefix(JsonObject request)
+        {
+            foreach (JsonObject message in GetSystemPrefixMessages(request))
+                if (GetLastSystemTextBlock(message, false) != null ||
+                    !string.IsNullOrWhiteSpace(ReadJsonString(message, "content"))) return true;
+            return false;
+        }
+
+        private static JsonObject GetLastSystemTextBlock(JsonObject message, bool normalizeString)
+        {
+            string text = ReadJsonString(message, "content");
+            if (text != null && normalizeString)
+            {
+                // Only normalize the documented string shorthand; never change text or role.
+                var block = new JsonObject { ["type"] = "input_text", ["text"] = text };
+                message["content"] = new JsonArray(block);
+                return string.IsNullOrWhiteSpace(text) ? null : block;
+            }
+            JsonArray content = message["content"] as JsonArray;
+            if (content == null) return null;
+            JsonObject last = null;
+            foreach (JsonNode item in content)
+            {
+                JsonObject block = item as JsonObject;
+                if (ReadJsonString(block, "type") == "input_text" &&
+                    !string.IsNullOrWhiteSpace(ReadJsonString(block, "text"))) last = block;
+            }
+            return last;
+        }
+
+        private static void AddSystemBreakpoint(JsonObject block)
+        {
+            // Responses uses this marker; OpenRouter translates it to Claude's 5m cache.
+            block["prompt_cache_breakpoint"] = new JsonObject { ["mode"] = "explicit" };
+        }
+
+        public static string GetClaudeRoutingKey(string json, string secret)
+        {
+            JsonObject request = JsonNode.Parse(json) as JsonObject;
+            return GetClaudeRoutingKey(request, secret);
+        }
+
+        private static string GetClaudeRoutingKey(JsonObject request, string secret)
+        {
+            if (request == null || !IsClaudeModel(ReadJsonString(request, "model"))) return null;
+            foreach (string name in new[] { "session_id", "prompt_cache_key" })
+            {
+                if (!request.ContainsKey(name)) continue;
+                string supplied = ReadJsonString(request, name);
+                if (string.IsNullOrWhiteSpace(supplied) || supplied.Length > 256 ||
+                    supplied.IndexOfAny(new[] { '\r', '\n' }) >= 0) return null;
+                return supplied;
+            }
+            if (string.IsNullOrEmpty(secret)) return null;
+            List<JsonObject> prefix = GetSystemPrefixMessages(request);
+            string instructions = ReadJsonString(request, "instructions");
+            if (prefix.Count == 0 && string.IsNullOrWhiteSpace(instructions)) return null;
+            var identity = new JsonObject
+            {
+                ["model"] = ReadJsonString(request, "model"),
+                ["instructions"] = instructions,
+                ["tools"] = request["tools"] == null ? null : request["tools"].DeepClone()
+            };
+            // The earliest system message is the most stable boundary. Dynamic later
+            // developer context and user turns must not rotate the fallback route.
+            if (prefix.Count > 0)
+            {
+                JsonObject message = (JsonObject)prefix[0].DeepClone();
+                GetLastSystemTextBlock(message, true);
+                RemoveCacheMarkers(message);
+                identity["system_prefix"] = message;
+            }
+            using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret)))
+            {
+                byte[] digest = hmac.ComputeHash(Encoding.UTF8.GetBytes(
+                    CanonicalJson(identity).ToJsonString()));
+                return "cxor-claude-" + Convert.ToHexString(digest).ToLowerInvariant();
+            }
+        }
+
+        private static void RemoveCacheMarkers(JsonNode node)
+        {
+            JsonObject obj = node as JsonObject;
+            if (obj != null)
+            {
+                obj.Remove("cache_control");
+                obj.Remove("prompt_cache_breakpoint");
+                foreach (var property in obj) RemoveCacheMarkers(property.Value);
+            }
+            JsonArray array = node as JsonArray;
+            if (array != null) foreach (JsonNode item in array) RemoveCacheMarkers(item);
+        }
+
+        private static JsonNode CanonicalJson(JsonNode node)
+        {
+            if (node == null) return null;
+            JsonObject obj = node as JsonObject;
+            if (obj != null)
+            {
+                var result = new JsonObject();
+                var names = new List<string>();
+                foreach (var property in obj) names.Add(property.Key);
+                names.Sort(StringComparer.Ordinal);
+                foreach (string name in names) result[name] = CanonicalJson(obj[name]);
+                return result;
+            }
+            JsonArray array = node as JsonArray;
+            if (array != null)
+            {
+                var result = new JsonArray();
+                foreach (JsonNode item in array) result.Add(CanonicalJson(item));
+                return result;
+            }
+            return node.DeepClone();
+        }
+
+        // Observes bounded copies only. It never alters or retains the forwarded stream.
+        public sealed class CacheUsageObserver
+        {
+            private const int MaximumEventBytes = 1024 * 1024;
+            private readonly bool eventStream;
+            private readonly MemoryStream line = new MemoryStream();
+            private readonly MemoryStream data = new MemoryStream();
+            private bool lineOverflow;
+            private bool dataOverflow;
+            private bool terminalSeen;
+            private string eventName = string.Empty;
+            private string completionStatus = "unknown";
+            private long? inputTokens;
+            private long? cachedTokens;
+            private long? writeTokens;
+            private long? outputTokens;
+            private decimal? cost;
+
+            public CacheUsageObserver(bool eventStream) { this.eventStream = eventStream; }
+
+            public void Append(byte[] bytes, int offset, int count)
+            {
+                if (terminalSeen) return;
+                try
+                {
+                    if (!eventStream)
+                    {
+                        AppendBounded(data, bytes, offset, count, ref dataOverflow);
+                        return;
+                    }
+                    for (int i = offset; i < offset + count; i++)
+                    {
+                        if (bytes[i] == 10)
+                        {
+                            ProcessLine();
+                            if (terminalSeen) break;
+                        }
+                        else if (!lineOverflow)
+                        {
+                            if (line.Length >= MaximumEventBytes)
+                            {
+                                line.SetLength(0);
+                                lineOverflow = true;
+                            }
+                            else line.WriteByte(bytes[i]);
+                        }
+                    }
+                }
+                catch (Exception) { ResetBuffers(); }
+            }
+
+            public void Complete()
+            {
+                try
+                {
+                    if (terminalSeen) return;
+                    if (eventStream)
+                    {
+                        if (line.Length > 0 || lineOverflow) ProcessLine();
+                        ProcessEvent();
+                    }
+                    else if (!dataOverflow) ObserveJson(data.ToArray(), null);
+                }
+                catch (Exception) { }
+                finally { ResetBuffers(); }
+            }
+
+            private static void AppendBounded(
+                MemoryStream target, byte[] bytes, int offset, int count, ref bool overflow)
+            {
+                if (overflow) return;
+                if (target.Length + count > MaximumEventBytes)
+                {
+                    target.SetLength(0);
+                    overflow = true;
+                    return;
+                }
+                target.Write(bytes, offset, count);
+            }
+
+            private void ProcessLine()
+            {
+                if (lineOverflow)
+                {
+                    dataOverflow = true;
+                    data.SetLength(0);
+                }
+                else
+                {
+                    byte[] bytes = line.ToArray();
+                    int length = bytes.Length;
+                    if (length > 0 && bytes[length - 1] == 13) length--;
+                    if (length == 0) ProcessEvent();
+                    else if (length >= 5 && bytes[0] == 'd' && bytes[1] == 'a' &&
+                        bytes[2] == 't' && bytes[3] == 'a' && bytes[4] == ':')
+                    {
+                        int start = length > 5 && bytes[5] == 32 ? 6 : 5;
+                        if (data.Length > 0)
+                            AppendBounded(data, new byte[] { 10 }, 0, 1, ref dataOverflow);
+                        AppendBounded(data, bytes, start, length - start, ref dataOverflow);
+                    }
+                    else if (length >= 6 && length <= 80 && bytes[0] == 'e' &&
+                        bytes[1] == 'v' && bytes[2] == 'e' && bytes[3] == 'n' &&
+                        bytes[4] == 't' && bytes[5] == ':')
+                        eventName = Encoding.UTF8.GetString(bytes, 6, length - 6).Trim();
+                }
+                line.SetLength(0);
+                lineOverflow = false;
+            }
+
+            private void ProcessEvent()
+            {
+                if (!dataOverflow && data.Length > 0 && !terminalSeen)
+                    ObserveJson(data.ToArray(), eventName);
+                data.SetLength(0);
+                dataOverflow = false;
+                eventName = string.Empty;
+            }
+
+            private void ObserveJson(byte[] bytes, string fallbackEvent)
+            {
+                try
+                {
+                    string json = new UTF8Encoding(false, true).GetString(bytes);
+                    JsonObject root = JsonNode.Parse(json, null,
+                        new JsonDocumentOptions { MaxDepth = 128 }) as JsonObject;
+                    if (root == null) return;
+                    JsonObject response = root;
+                    if (eventStream)
+                    {
+                        string type = ReadJsonString(root, "type") ?? fallbackEvent;
+                        if (type != "response.completed" && type != "response.incomplete" &&
+                            type != "response.failed") return;
+                        response = root["response"] as JsonObject;
+                        completionStatus = type.Substring("response.".Length);
+                    }
+                    else
+                    {
+                        string state = ReadJsonString(root, "status");
+                        if (state == "completed" || state == "incomplete" || state == "failed")
+                            completionStatus = state;
+                    }
+                    terminalSeen = true;
+                    if (response == null || completionStatus == "failed") return;
+                    JsonObject usage = response["usage"] as JsonObject;
+                    if (usage == null) return;
+                    inputTokens = ReadCount(usage, "input_tokens") ?? ReadCount(usage, "prompt_tokens");
+                    outputTokens = ReadCount(usage, "output_tokens") ?? ReadCount(usage, "completion_tokens");
+                    JsonObject details = usage["input_tokens_details"] as JsonObject ??
+                        usage["prompt_tokens_details"] as JsonObject;
+                    cachedTokens = ReadCount(details, "cached_tokens");
+                    writeTokens = ReadCount(details, "cache_write_tokens");
+                    if (inputTokens.HasValue &&
+                        ((cachedTokens.HasValue && cachedTokens > inputTokens) ||
+                         (writeTokens.HasValue && writeTokens > inputTokens) ||
+                         (cachedTokens.HasValue && writeTokens.HasValue &&
+                          (decimal)cachedTokens.Value + writeTokens.Value > inputTokens.Value)))
+                    {
+                        cachedTokens = null;
+                        writeTokens = null;
+                    }
+                    JsonValue costNode = usage["cost"] as JsonValue;
+                    decimal parsedCost;
+                    if (costNode != null && costNode.TryGetValue<decimal>(out parsedCost) && parsedCost >= 0)
+                        cost = parsedCost;
+                }
+                catch (JsonException) { }
+                catch (DecoderFallbackException) { }
+                catch (InvalidOperationException) { }
+                catch (OverflowException) { }
+            }
+
+            private static long? ReadCount(JsonObject obj, string name)
+            {
+                JsonValue node = obj == null ? null : obj[name] as JsonValue;
+                long value;
+                return node != null && node.TryGetValue<long>(out value) && value >= 0
+                    ? (long?)value : null;
+            }
+
+            private void ResetBuffers()
+            {
+                line.SetLength(0);
+                data.SetLength(0);
+                lineOverflow = false;
+                dataOverflow = false;
+                eventName = string.Empty;
+            }
+
+            public string SnapshotJson()
+            {
+                string status = "unknown";
+                if (inputTokens.HasValue && cachedTokens.HasValue)
+                {
+                    if (cachedTokens.Value > 0) status = "hit";
+                    else if (writeTokens.HasValue) status = writeTokens.Value > 0 ? "write" : "miss";
+                }
+                return new JsonObject
+                {
+                    ["status"] = status,
+                    ["completion_status"] = completionStatus,
+                    ["usage_known"] = inputTokens.HasValue,
+                    ["input_tokens"] = inputTokens,
+                    ["cached_tokens"] = cachedTokens,
+                    ["cache_write_tokens"] = writeTokens,
+                    ["output_tokens"] = outputTokens,
+                    ["cost"] = cost,
+                    ["system_cache_coverage"] = "unknown"
+                }.ToJsonString();
+            }
         }
 
         public static string CreateErrorJson(string message, string type, string code)
@@ -738,6 +1144,13 @@ namespace CodexOpenRouter
             private int lastUpstreamStatus;
             private int lastRequestBytes;
             private string lastErrorUtc = string.Empty;
+            private long claudeRequests;
+            private long claudeHits;
+            private long claudeWrites;
+            private long claudeMisses;
+            private long claudeUnknown;
+            private long claudeRejected;
+            private JsonObject lastClaudeCache;
 
             internal ProxyServer(int port, string token)
             {
@@ -875,6 +1288,7 @@ namespace CodexOpenRouter
                 }
                 finally
                 {
+                    if (requestState.IsClaude) RecordClaudeCache(requestState);
                     if (requestState.AbortResponse)
                     {
                         try { context.Response.Abort(); } catch { }
@@ -957,7 +1371,17 @@ namespace CodexOpenRouter
                 byte[] requestBody = await ReadBodyAsync(incoming).ConfigureAwait(false);
                 requestState.RequestBytes = requestBody.Length;
                 requestState.Phase = "rewrite_request";
-                byte[] upstreamBody = RewriteRequestBody(requestBody);
+                string requestJson = new UTF8Encoding(false, true).GetString(requestBody);
+                JsonObject originalRequest = JsonNode.Parse(requestJson, null,
+                    new JsonDocumentOptions { MaxDepth = 128 }) as JsonObject;
+                requestState.IsClaude = IsClaudeModel(ReadJsonString(originalRequest, "model"));
+                if (requestState.IsClaude)
+                {
+                    requestState.CachePolicy = HasCachePolicy(originalRequest) ? "caller_policy" :
+                        (HasEligibleSystemPrefix(originalRequest) ?
+                            "system_prefix" : "automatic_only");
+                }
+                byte[] upstreamBody = RewriteRequestBody(requestBody, originalRequest);
                 string query = incoming.Url == null ? string.Empty : incoming.Url.Query;
                 var upstreamUri = new Uri(
                     "https://openrouter.ai/api/v1/responses" + query,
@@ -970,6 +1394,14 @@ namespace CodexOpenRouter
                     upstreamRequest.Content = content;
                     requestState.Phase = "copy_request_headers";
                     CopyRequestHeaders(incoming, upstreamRequest);
+                    if (requestState.IsClaude && incoming.Headers["x-session-id"] == null &&
+                        !originalRequest.ContainsKey("session_id") &&
+                        !originalRequest.ContainsKey("prompt_cache_key"))
+                    {
+                        string routingKey = GetClaudeRoutingKey(originalRequest, token);
+                        if (routingKey != null)
+                            upstreamRequest.Headers.TryAddWithoutValidation("x-session-id", routingKey);
+                    }
                     upstreamRequest.Headers.Remove("Accept-Encoding");
                     upstreamRequest.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
                     content.Headers.Remove("Content-Type");
@@ -1030,6 +1462,14 @@ namespace CodexOpenRouter
                         CopyResponseHeaders(upstream, outgoing);
                         outgoing.SendChunked = true;
 
+                        string mediaType = upstream.Content.Headers.ContentType == null ?
+                            string.Empty : upstream.Content.Headers.ContentType.MediaType;
+                        if (requestState.IsClaude && upstream.Content.Headers.ContentEncoding.Count == 0 &&
+                            (string.Equals(mediaType, "text/event-stream", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase)))
+                            requestState.Usage = new CacheUsageObserver(
+                                string.Equals(mediaType, "text/event-stream", StringComparison.OrdinalIgnoreCase));
+
                         requestState.Phase = "open_upstream_stream";
                         using (Stream source = await upstream.Content.ReadAsStreamAsync()
                             .ConfigureAwait(false))
@@ -1043,12 +1483,14 @@ namespace CodexOpenRouter
                                     int read = await source.ReadAsync(buffer, 0, buffer.Length)
                                         .ConfigureAwait(false);
                                     if (read == 0) break;
+                                    if (requestState.Usage != null) requestState.Usage.Append(buffer, 0, read);
                                     requestState.Phase = "write_downstream";
                                     requestState.ResponseStarted = true;
                                     await outgoing.OutputStream.WriteAsync(buffer, 0, read)
                                         .ConfigureAwait(false);
                                     await outgoing.OutputStream.FlushAsync().ConfigureAwait(false);
                                 }
+                                if (requestState.Usage != null) requestState.Usage.Complete();
                             }
                             catch
                             {
@@ -1065,7 +1507,7 @@ namespace CodexOpenRouter
                 var health = new JsonObject
                 {
                     ["status"] = "ok",
-                    ["schema"] = 3,
+                    ["schema"] = 4,
                     ["pid"] = Environment.ProcessId,
                     ["total_requests"] = Interlocked.Read(ref totalRequests),
                     ["total_failures"] = Interlocked.Read(ref totalFailures)
@@ -1078,6 +1520,16 @@ namespace CodexOpenRouter
                     health["last_upstream_status"] = lastUpstreamStatus;
                     health["last_request_bytes"] = lastRequestBytes;
                     health["last_error_utc"] = lastErrorUtc;
+                    health["claude_cache"] = new JsonObject
+                    {
+                        ["requests"] = claudeRequests,
+                        ["hit_requests"] = claudeHits,
+                        ["write_requests"] = claudeWrites,
+                        ["miss_requests"] = claudeMisses,
+                        ["unknown_requests"] = claudeUnknown,
+                        ["rejected_requests"] = claudeRejected,
+                        ["last"] = lastClaudeCache == null ? null : lastClaudeCache.DeepClone()
+                    };
                 }
                 return Encoding.UTF8.GetBytes(
                     health.ToJsonString(
@@ -1105,6 +1557,42 @@ namespace CodexOpenRouter
                     lastRequestBytes = requestState.RequestBytes;
                     lastErrorUtc = DateTimeOffset.UtcNow.ToString("O");
                 }
+            }
+
+            private void RecordClaudeCache(ProxyRequestState state)
+            {
+                // Parsing and reporting must never break a model response or trigger a retry.
+                try
+                {
+                    JsonObject usage = JsonNode.Parse((state.Usage ??
+                        new CacheUsageObserver(false)).SnapshotJson()) as JsonObject;
+                    string result = ReadJsonString(usage, "status");
+                    if (state.UpstreamStatus >= 400)
+                    {
+                        result = "rejected";
+                        usage["status"] = result;
+                        usage["completion_status"] = "rejected";
+                    }
+                    else if (state.AbortResponse || state.FailureRecorded)
+                        usage["completion_status"] = "transport_error";
+                    usage["http_status"] = state.UpstreamStatus;
+                    usage["policy"] = state.CachePolicy;
+                    usage["observed_utc"] = DateTimeOffset.UtcNow.ToString("O");
+                    lock (diagnosticsSync)
+                    {
+                        claudeRequests++;
+                        switch (result)
+                        {
+                            case "hit": claudeHits++; break;
+                            case "write": claudeWrites++; break;
+                            case "miss": claudeMisses++; break;
+                            case "rejected": claudeRejected++; break;
+                            default: claudeUnknown++; break;
+                        }
+                        lastClaudeCache = usage;
+                    }
+                }
+                catch (Exception) { }
             }
 
             private static async Task<byte[]> ReadSafeErrorBodyAsync(
@@ -1335,6 +1823,9 @@ namespace CodexOpenRouter
                 internal bool FailureRecorded { get; set; }
                 internal int RequestBytes { get; set; }
                 internal int UpstreamStatus { get; set; }
+                internal bool IsClaude { get; set; }
+                internal string CachePolicy { get; set; } = "unknown";
+                internal CacheUsageObserver Usage { get; set; }
             }
         }
     }
@@ -1352,7 +1843,7 @@ function Start-CxProxyServer {
         throw '缓存代理缺少有效的启动令牌。'
     }
     Initialize-CxProxyType
-    [CodexOpenRouter.OpenRouterCacheProxyV3]::RunAsync($Port, $token).
+    [CodexOpenRouter.OpenRouterCacheProxyV4]::RunAsync($Port, $token).
         GetAwaiter().GetResult()
 }
 
@@ -1392,7 +1883,7 @@ function Get-CxProxyState {
     }
     catch { return $null }
     $started = [DateTimeOffset]::MinValue
-    if ($schema -notin @(1, 2, 3) -or
+    if ($schema -notin @(1, 2, 3, 4) -or
         $processId -le 0 -or
         $port -lt 1024 -or $port -gt 65535 -or
         [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
@@ -1442,11 +1933,11 @@ function Test-CxProxyHealthContent {
         [Parameter(Mandatory)][int]$ExpectedProcessId
     )
 
-    if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt 1024) { return $false }
+    if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt 8192) { return $false }
     try { $health = $Content | ConvertFrom-Json -ErrorAction Stop }
     catch { return $false }
     return [string]$health.status -ceq 'ok' -and
-        [int]$health.schema -eq 3 -and
+        [int]$health.schema -eq 4 -and
         [int]$health.pid -eq $ExpectedProcessId
 }
 
@@ -1498,6 +1989,70 @@ function Remove-CxProxyStateFile {
         throw "缓存代理状态文件无法安全删除：$StatePath"
     }
     Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+}
+
+function Get-CxClaudeCacheStatus {
+    Assert-CxRuntime
+    $state = Get-CxProxyState -StatePath (Get-CxPaths).ProxyStatePath
+    if ($null -eq $state -or -not (Test-CxProxyProcess $state)) {
+        throw '没有运行中的缓存代理。请先运行 cxor；此查询不会启动代理或调用模型。'
+    }
+    if ($state.Schema -ne 4) {
+        throw '当前代理尚未支持 Claude 缓存检测。安装新版后运行一次 cxor 以加载新版代理。'
+    }
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(2)
+    $client.MaxResponseContentBufferSize = 8192
+    $request = [Net.Http.HttpRequestMessage]::new(
+        [Net.Http.HttpMethod]::Get,
+        "http://127.0.0.1:$($state.Port)/__cxor/health"
+    )
+    try {
+        [void]$request.Headers.TryAddWithoutValidation($script:ProxyHeaderName, [string]$state.Token)
+        $response = $client.Send($request)
+        try {
+            if (-not $response.IsSuccessStatusCode) { throw '缓存状态查询失败。' }
+            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if (-not (Test-CxProxyHealthContent -Content $body -ExpectedProcessId $state.ProcessId)) {
+                throw '缓存代理健康状态无效。'
+            }
+            $cache = ($body | ConvertFrom-Json -ErrorAction Stop).claude_cache
+            $last = $cache.last
+            $ratio = if ($null -ne $last -and $null -ne $last.cached_tokens -and
+                $null -ne $last.input_tokens -and $last.input_tokens -gt 0) {
+                [Math]::Round(100.0 * $last.cached_tokens / $last.input_tokens, 2)
+            } else { $null }
+            [pscustomobject][ordered]@{
+                ClaudeRequests = $cache.requests
+                CacheHitRequests = $cache.hit_requests
+                CacheWriteRequests = $cache.write_requests
+                CacheMissRequests = $cache.miss_requests
+                UnknownRequests = $cache.unknown_requests
+                RejectedRequests = $cache.rejected_requests
+                LastStatus = if ($null -ne $last) { $last.status } else { 'no_requests' }
+                CompletionStatus = if ($null -ne $last) { $last.completion_status } else { $null }
+                HttpStatus = if ($null -ne $last) { $last.http_status } else { $null }
+                Policy = if ($null -ne $last) { $last.policy } else { $null }
+                InputTokens = if ($null -ne $last) { $last.input_tokens } else { $null }
+                CachedTokens = if ($null -ne $last) { $last.cached_tokens } else { $null }
+                CacheReadPercent = $ratio
+                CacheWriteTokens = if ($null -ne $last) { $last.cache_write_tokens } else { $null }
+                OutputTokens = if ($null -ne $last) { $last.output_tokens } else { $null }
+                CostUSD = if ($null -ne $last) { $last.cost } else { $null }
+                SystemCacheCoverage = 'unknown'
+                ObservedUtc = if ($null -ne $last) { $last.observed_utc } else { $null }
+            }
+        }
+        finally { $response.Dispose() }
+    }
+    finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
 }
 
 function Start-CxOpenRouterProxy {
@@ -1570,7 +2125,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
         }
 
         $stateContent = [ordered]@{
-            schema = 3
+            schema = 4
             pid = $process.Id
             port = $Port
             token = $Token
@@ -2470,8 +3025,13 @@ function cxor {
     [CmdletBinding()]
     param(
         [switch]$SetKey,
-        [switch]$AllModels
+        [switch]$AllModels,
+        [switch]$CacheStatus
     )
+    if ($CacheStatus) {
+        if ($SetKey -or $AllModels) { throw '-CacheStatus 不能与 -SetKey 或 -AllModels 同时使用。' }
+        return Get-CxClaudeCacheStatus
+    }
     Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey -AllModels:$AllModels
 }
 

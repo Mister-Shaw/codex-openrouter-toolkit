@@ -4,7 +4,7 @@
 
 ## 支持版本
 
-安全修复只面向当前版本 `0.1.10`。旧版本用户应先更新，再确认问题是否仍然存在。
+安全修复面向当前源码版本 `0.1.11`。发布状态见 [变更记录](CHANGELOG.md)；旧版本用户应先更新，再确认问题是否仍然存在。
 
 ## API Key
 
@@ -17,10 +17,11 @@
 
 ## 网络与模型
 
-- 每次运行 `cxor` 都会连接 OpenRouter，按当前 Codex CLI 版本尝试同步最新 Codex 专用模型信息，并生成和验证本地模型目录。
+- 除只读的 `cxor -CacheStatus` 外，每次运行 `cxor` 都会连接 OpenRouter，按当前 Codex CLI 版本尝试同步最新 Codex 专用模型信息，并生成和验证本地模型目录。
 - 新目录必须包含官方入口 `~openai/gpt-latest`，缺失时会在发布前拒绝。
 - OpenRouter 模式下，对话请求会经过 OpenRouter，并可能发送给所选模型的下游供应商。请按所选供应商的数据政策处理敏感内容。
-- 所有 OpenRouter Responses 请求先经过本机缓存感知代理。代理只为缺少顶层 `cache_control` 的 Claude 请求加入 5 分钟 `ephemeral` 缓存提示；其他模型保持请求正文不变并使用上游支持的自动缓存。缓存会让提供商在其数据中心短期保留提示前缀，具体期限、计费与数据政策由模型和上游端点决定。
+- 所有 OpenRouter Responses 请求先经过本机缓存感知代理。Claude 请求没有自定义缓存策略时，代理加入顶层默认 5 分钟 `ephemeral`，并为前部连续系统/开发者消息的首尾可标记消息添加最多两个缓存断点；提示文本、角色、顺序、`instructions` 与工具定义保留。已有缓存策略的 Claude 请求和其他模型保持请求正文不变。缓存会让提供商在其数据中心短期保留提示前缀，具体期限、计费与数据政策由模型和上游端点决定。
+- 既有正文 `session_id`、请求头 `x-session-id` 和 `prompt_cache_key` 保留。缺少路由标识的 Claude 请求可补充 HMAC 派生路由请求头，输入为模型、`instructions`、首条系统消息与工具定义，密钥为本地代理令牌。该派生值不含提示明文；本地令牌不会直接发往上游。代理不会自动预热或重试推理，缓存标记和路由键均不构成命中或费用保证。
 - 工具包会把目录内每个模型的 `base_instructions` 与 `model_messages.instructions_template` 写为空字符串。Codex Desktop 仍会提供 developer 上下文、工具定义和权限控制；不同模型对 Responses API 和工具调用的支持程度仍有差异。
 - 新目录同步或校验失败时不会覆盖最后一个有效目录。存在有效旧目录时会重新校验后复用并显示警告；全部来源均不可用时中止切换，正在运行的 Codex Desktop 不会被关闭。
 
@@ -28,7 +29,9 @@
 
 安装器把模块写入当前用户的 PowerShell 模块目录，并清理旧版本遗留的 Profile 区块。安装阶段不会写入 Codex 配置。
 
-运行 `cxor` 会写入 `<CODEX_HOME>/openrouter-model-catalog.json` 和 `<CODEX_HOME>/openrouter-cache-proxy.json`，启动一个仅绑定 `127.0.0.1` 随机高位端口的后台 PowerShell 代理，并在 `config.toml` 中加入工具包托管的 OpenRouter 配置。TOML 与代理状态文件会保存一个随机生成的 256 位本地代理令牌；该令牌只用于阻止其他本地进程误用监听端口，不具备 OpenRouter 账户权限。
+除 `-CacheStatus` 外，运行 `cxor` 会写入 `<CODEX_HOME>/openrouter-model-catalog.json` 和 `<CODEX_HOME>/openrouter-cache-proxy.json`，启动一个仅绑定 `127.0.0.1` 随机高位端口的后台 PowerShell 代理，并在 `config.toml` 中加入工具包托管的 OpenRouter 配置。TOML 与代理状态文件会保存一个随机生成的 256 位本地代理令牌；该令牌用于保护监听端口，并作为 Claude 回退路由 HMAC 的本地密钥，不具备 OpenRouter 账户权限。
+
+`cxor -CacheStatus` 只读访问当前代理的认证健康接口，不调用模型、不刷新目录、不启动或重启代理及桌面端。V4 代理对响应做有界内存解析并透传原始字节，健康信息仅保留累计计数、最近 token/费用数字和固定状态；不保存模型 ID、提示、响应正文或逐条请求历史。统计随代理退出而清空，不会写入状态文件。无法解析或缺失的用量保持未知，聚合统计无法证明整个系统提示命中缓存。
 
 运行 `cx` 会移除 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置；经过身份校验的后台代理与状态文件继续服务已经打开的 OpenRouter 任务。运行 `cx -StopProxy` 或卸载器会停止代理并清理状态文件，卸载器还会清理目录。
 

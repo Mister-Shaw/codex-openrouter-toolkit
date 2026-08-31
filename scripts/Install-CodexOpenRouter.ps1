@@ -15,7 +15,7 @@ if (-not $IsWindows) {
 }
 
 $script:ToolkitGuid = 'be74dba0-28ed-4ba3-adff-f0fc0d107b39'
-$script:ToolkitVersion = [version]'0.1.10'
+$script:ToolkitVersion = [version]'0.1.11'
 $script:ProfileStartMarkers = @(
     '# >>> codex-openrouter-toolkit >>>',
     '# >>> Codex desktop provider shortcuts >>>'
@@ -130,7 +130,7 @@ function Get-ValidatedModulePackage {
             $exports.Count -ne 2 -or
             $exports -cnotcontains 'cx' -or
             $exports -cnotcontains 'cxor') {
-            throw '待安装模块必须是 0.1.10，且只能导出 cx 与 cxor。'
+            throw '待安装模块必须是 0.1.11，且只能导出 cx 与 cxor。'
         }
     }
 
@@ -410,7 +410,7 @@ foreach ($commandName in @('cx', 'cxor')) {
 
 if (-not $PSCmdlet.ShouldProcess(
         "$moduleRoot、旧版 Profile 标记与 $legacyRoot",
-        '安装 Codex OpenRouter Toolkit 0.1.10'
+        '安装 Codex OpenRouter Toolkit 0.1.11'
     )) {
     return
 }
@@ -516,7 +516,7 @@ if ($legacyInfo -and (Test-Path -LiteralPath $legacyInfo.Root -PathType Containe
         $legacyRemoved = $true
     }
     catch {
-        Write-Warning "0.1.10 已安装，但旧版安装未能完全清理：$($_.Exception.Message)"
+        Write-Warning "0.1.11 已安装，但旧版安装未能完全清理：$($_.Exception.Message)"
     }
 }
 
@@ -527,7 +527,7 @@ if ($previousRoot -and (Test-Path -LiteralPath $previousRoot -PathType Container
 
 [pscustomobject]@{
     Installed = $true
-    InstalledVersion = '0.1.10'
+    InstalledVersion = '0.1.11'
     ModulePath = $installedPackage.ManifestPath
     AutoLoadEnabled = $true
     ProfileMarkersRemoved = $profilePlans.Count

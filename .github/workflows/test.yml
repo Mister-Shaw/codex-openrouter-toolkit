@@ -58,3 +58,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
           }
+          & $runtime -NoLogo -NoProfile -File .\tests\Run-ClaudeCacheTests.ps1
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }

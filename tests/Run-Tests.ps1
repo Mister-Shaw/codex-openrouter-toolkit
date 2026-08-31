@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.10' `
+        -Expected '0.1.11' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -173,7 +173,7 @@ try {
         }
         $passThrough = foreach ($entry in $passThroughInputs.GetEnumerator()) {
             $bytes = [Text.Encoding]::UTF8.GetBytes([string]$entry.Value)
-            $rewrittenBytes = [CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestBody(
+            $rewrittenBytes = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestBody(
                 $bytes
             )
             [pscustomobject]@{
@@ -185,51 +185,51 @@ try {
         }
         [pscustomobject]@{
             ClaudeInput = $claudeInput
-            Claude = [CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestJson(
+            Claude = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
                 $claudeInput
             )
-            Tilde = [CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestJson(
+            Tilde = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
                 $tildeInput
             )
             ExistingInput = $existingInput
-            Existing = [CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestJson(
+            Existing = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
                 $existingInput
             )
             NullInput = $nullInput
-            Null = [CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestJson(
+            Null = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
                 $nullInput
             )
-            LocalError = [CodexOpenRouter.OpenRouterCacheProxyV3]::CreateErrorJson(
+            LocalError = [CodexOpenRouter.OpenRouterCacheProxyV4]::CreateErrorJson(
                 'Local OpenRouter proxy failed at send_upstream.',
                 'cxor_proxy_error',
                 'send_upstream'
             )
-            EscapedError = [CodexOpenRouter.OpenRouterCacheProxyV3]::CreateErrorJson(
+            EscapedError = [CodexOpenRouter.OpenRouterCacheProxyV4]::CreateErrorJson(
                 "quote `" slash \ newline`n",
                 'cxor_proxy_error',
                 'escaped_error'
             )
-            EmptyUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            EmptyUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 '',
                 502
             )
-            StringUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            StringUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 '{"error":"rate limited"}',
                 429
             )
-            StructuredUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            StructuredUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 '{"error":{"message":"unauthorized","type":"authentication_error","code":401}}',
                 401
             )
-            HtmlUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            HtmlUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 '<html>sk-or-sensitive-diagnostic-value</html>',
                 502
             )
-            UnknownUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            UnknownUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 '{"error":{"message":"Unknown error"}}',
                 502
             )
-            OversizedUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV3]::NormalizeUpstreamErrorJson(
+            OversizedUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
                 ('{"error":{"message":"' + ('x' * 2049) + '"}}'),
                 502
             )
@@ -315,7 +315,7 @@ try {
         -Action {
             & $module {
                 Initialize-CxProxyType
-                [void][CodexOpenRouter.OpenRouterCacheProxyV3]::RewriteRequestJson('{')
+                [void][CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson('{')
             }
         } `
         -Pattern '*' `
@@ -393,7 +393,7 @@ try {
         [void](New-Item -ItemType Directory -Path $temporaryRoot -ErrorAction Stop)
         $statePath = Join-Path $temporaryRoot 'state.json'
         try {
-            $records = foreach ($schema in @(1, 2, 3, 0, 4)) {
+            $records = foreach ($schema in @(1, 2, 3, 4, 0, 5)) {
                 $content = [ordered]@{
                     schema = $schema
                     pid = 32123
@@ -412,14 +412,23 @@ try {
             }
             [pscustomobject]@{
                 Records = @($records)
+                HealthV4 = Test-CxProxyHealthContent `
+                    -Content '{"status":"ok","schema":4,"pid":32123,"total_requests":4,"total_failures":1,"last_error_source":"upstream","last_error_code":"upstream_http_502","last_error_phase":"upstream_response","last_upstream_status":502,"last_request_bytes":299833,"last_error_utc":"2026-08-28T09:22:06Z"}' `
+                    -ExpectedProcessId 32123
                 HealthV3 = Test-CxProxyHealthContent `
-                    -Content '{"status":"ok","schema":3,"pid":32123,"total_requests":4,"total_failures":1,"last_error_source":"upstream","last_error_code":"upstream_http_502","last_error_phase":"upstream_response","last_upstream_status":502,"last_request_bytes":299833,"last_error_utc":"2026-08-28T09:22:06Z"}' `
+                    -Content '{"status":"ok","schema":3,"pid":32123}' `
                     -ExpectedProcessId 32123
                 HealthV2 = Test-CxProxyHealthContent `
                     -Content '{"status":"ok","schema":2,"pid":32123}' `
                     -ExpectedProcessId 32123
                 WrongPid = Test-CxProxyHealthContent `
-                    -Content '{"status":"ok","schema":3,"pid":32124}' `
+                    -Content '{"status":"ok","schema":4,"pid":32124}' `
+                    -ExpectedProcessId 32123
+                ExpandedV4 = Test-CxProxyHealthContent `
+                    -Content ('{"status":"ok","schema":4,"pid":32123,"padding":"' + ('x' * 2048) + '"}') `
+                    -ExpectedProcessId 32123
+                Oversized = Test-CxProxyHealthContent `
+                    -Content ('{"status":"ok","schema":4,"pid":32123,"padding":"' + ('x' * 8192) + '"}') `
                     -ExpectedProcessId 32123
                 Malformed = Test-CxProxyHealthContent `
                     -Content '{' `
@@ -449,6 +458,9 @@ try {
     $stateV3 = $proxyStateValidation.Records |
         Where-Object InputSchema -EQ 3 |
         Select-Object -First 1
+    $stateV4 = $proxyStateValidation.Records |
+        Where-Object InputSchema -EQ 4 |
+        Select-Object -First 1
     Assert-True `
         -Condition ([bool]$stateV1.Accepted) `
         -Message 'V1 proxy state remains readable for safe upgrades'
@@ -470,7 +482,14 @@ try {
         -Actual ([int]$stateV3.ParsedSchema) `
         -Expected 3 `
         -Message 'V3 proxy state preserves its implementation schema'
-    foreach ($invalidSchema in @(0, 4)) {
+    Assert-True `
+        -Condition ([bool]$stateV4.Accepted) `
+        -Message 'V4 proxy state is accepted'
+    Assert-Equal `
+        -Actual ([int]$stateV4.ParsedSchema) `
+        -Expected 4 `
+        -Message 'V4 proxy state preserves its implementation schema'
+    foreach ($invalidSchema in @(0, 5)) {
         $invalidState = $proxyStateValidation.Records |
             Where-Object InputSchema -EQ $invalidSchema |
             Select-Object -First 1
@@ -479,14 +498,23 @@ try {
             -Message "Proxy state rejects schema $invalidSchema"
     }
     Assert-True `
-        -Condition ([bool]$proxyStateValidation.HealthV3) `
-        -Message 'V3 proxy health with sanitized diagnostics is accepted'
+        -Condition ([bool]$proxyStateValidation.HealthV4) `
+        -Message 'V4 proxy health with sanitized diagnostics is accepted'
+    Assert-True `
+        -Condition (-not [bool]$proxyStateValidation.HealthV3) `
+        -Message 'V3 proxy health triggers an implementation upgrade'
     Assert-True `
         -Condition (-not [bool]$proxyStateValidation.HealthV2) `
         -Message 'V2 proxy health triggers an implementation upgrade'
     Assert-True `
         -Condition (-not [bool]$proxyStateValidation.WrongPid) `
         -Message 'Proxy health rejects a mismatched process id'
+    Assert-True `
+        -Condition ([bool]$proxyStateValidation.ExpandedV4) `
+        -Message 'V4 health accepts expanded cache accounting beyond the old 1KB limit'
+    Assert-True `
+        -Condition (-not [bool]$proxyStateValidation.Oversized) `
+        -Message 'Proxy health keeps an 8KB response bound'
     Assert-True `
         -Condition (-not [bool]$proxyStateValidation.Malformed) `
         -Message 'Proxy health rejects malformed JSON'
@@ -522,7 +550,7 @@ try {
             function script:Get-CxProxyState {
                 param([string]$StatePath)
                 [pscustomobject]@{
-                    Schema = 2
+                    Schema = 3
                     ProcessId = 65432
                     Port = 43127
                     Token = 'B' * 64
@@ -561,7 +589,7 @@ try {
                 $script:UpgradeStartPort = $Port
                 $script:UpgradeStartToken = $Token
                 return [pscustomobject]@{
-                    Schema = 3
+                    Schema = 4
                     ProcessId = 65433
                     Port = $Port
                     Token = $Token
@@ -602,28 +630,28 @@ try {
     }
     Assert-Equal `
         -Actual $proxyUpgrade.ResultSchema `
-        -Expected 3 `
-        -Message 'V2 proxy is replaced with the V3 implementation'
+        -Expected 4 `
+        -Message 'V3 proxy is replaced with the V4 implementation'
     Assert-Equal `
         -Actual $proxyUpgrade.StopCalls `
         -Expected 1 `
-        -Message 'V2 proxy process is stopped exactly once'
+        -Message 'V3 proxy process is stopped exactly once'
     Assert-Equal `
         -Actual $proxyUpgrade.RemoveCalls `
         -Expected 1 `
-        -Message 'V2 proxy state is removed before replacement'
+        -Message 'V3 proxy state is removed before replacement'
     Assert-Equal `
         -Actual $proxyUpgrade.FreePortCalls `
         -Expected 0 `
-        -Message 'V2 proxy upgrade first reuses the existing loopback port'
+        -Message 'V3 proxy upgrade first reuses the existing loopback port'
     Assert-Equal `
         -Actual $proxyUpgrade.StartPort `
         -Expected 43127 `
-        -Message 'V2 proxy upgrade preserves the existing loopback port'
+        -Message 'V3 proxy upgrade preserves the existing loopback port'
     Assert-Equal `
         -Actual $proxyUpgrade.StartToken `
         -Expected ('B' * 64) `
-        -Message 'V2 proxy upgrade preserves the existing local token'
+        -Message 'V3 proxy upgrade preserves the existing local token'
 
     $requestKey = 'sk-' + 'or-' + ('q' * 24)
     $requestResult = & $module {

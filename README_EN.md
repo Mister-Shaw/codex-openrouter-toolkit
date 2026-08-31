@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.10`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.11`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -16,8 +16,9 @@ A community-maintained Windows PowerShell toolkit that switches Codex Desktop be
 | `cxor` | Synchronizes the latest Codex-compatible OpenRouter catalog, starts the local cache-aware proxy, shows a curated set of Claude and OpenAI models, switches to OpenRouter, and requests a desktop restart. |
 | `cxor -SetKey` | Securely prompts for and stores or rotates the current Windows user's OpenRouter API key, then enters OpenRouter mode. |
 | `cxor -AllModels` | Makes every model in the selected validated OpenRouter catalog visible. May be combined with `-SetKey`. |
+| `cxor -CacheStatus` | Reads local Claude cache usage and the latest reported cost without calling a model, refreshing the catalog, or restarting Desktop. |
 
-On every run, `cxor` queries the fixed HTTPS URL `https://openrouter.ai/api/v1/models` with the current Codex CLI three-part version as `client_version` and the `originator: Codex Desktop` header. HTTP redirects are disabled, and no 24-hour cache is used. If the direct response is unavailable or fails validation, the toolkit checks Codex CLI stdout, the provider-specific temporary cache, the generic temporary cache, other temporary model caches, and the last valid catalog. A candidate is published only after its structure, model IDs, duplicate entries, default entry, and prompt fields pass validation. Reusing the last valid catalog produces a warning. If every source fails, the switch stops before the Codex configuration is modified or the running desktop process is closed. `-AllModels` marks every entry in the selected catalog as visible.
+Except for read-only `-CacheStatus`, every `cxor` run queries the fixed HTTPS URL `https://openrouter.ai/api/v1/models` with the current Codex CLI three-part version as `client_version` and the `originator: Codex Desktop` header. HTTP redirects are disabled, and no 24-hour cache is used. If the direct response is unavailable or fails validation, the toolkit checks Codex CLI stdout, the provider-specific temporary cache, the generic temporary cache, other temporary model caches, and the last valid catalog. A candidate is published only after its structure, model IDs, duplicate entries, default entry, and prompt fields pass validation. Reusing the last valid catalog produces a warning. If every source fails, the switch stops before the Codex configuration is modified or the running desktop process is closed. `-AllModels` marks every entry in the selected catalog as visible.
 
 ## Requirements
 
@@ -94,17 +95,36 @@ Models vary in their support for the Responses API and tool calling. Clearing th
 
 In OpenRouter mode, every OpenRouter Responses API request from Codex first passes through the toolkit's local loopback proxy. The proxy applies a capability-aware policy:
 
-- Claude: when the model ID is `anthropic/claude-*` or `~anthropic/claude-*` and the request has no `cache_control` property, the proxy injects `{"type":"ephemeral"}` so OpenRouter can establish the default five-minute prompt cache.
-- If a Claude request already contains `cache_control`, the value is preserved exactly. This includes an explicit `null` value.
+- Claude: for model IDs matching `anthropic/claude-*` or `~anthropic/claude-*`, requests without a custom cache policy receive top-level `cache_control: {"type":"ephemeral"}`, retaining the default five-minute lifetime.
+- The proxy also examines the initial consecutive `system` / `developer` messages in `input`. It adds `prompt_cache_breakpoint` to the final `input_text` block of the first and last eligible messages, creating at most two markers; a single eligible message receives one. These boundaries cover the more stable opening instructions and the full leading instruction section.
+- `instructions`, tools, message roles, prompt text, and ordering are preserved. The proxy does not move `instructions`. Requests with only `instructions` and no eligible leading system messages continue to use top-level automatic caching.
+- A request with existing top-level `cache_control` (including `null` or a one-hour policy), `prompt_cache_options`, or block-level cache markers keeps its entire body byte-for-byte. An explicit `null` is never changed to enable caching.
 - Requests for OpenAI, DeepSeek, Grok, Moonshot, Groq, Z.AI, Gemini, and similar families are forwarded byte-for-byte in the request body and use any automatic caching supported by the selected model and upstream provider.
 - Unknown models and models with undocumented or incompatible caching behavior are also forwarded unchanged. Catalog presence does not imply prompt-cache support.
-- Codex's `prompt_cache_key` is preserved. When `session_id` is absent, OpenRouter can use that key for sticky routing, improving the chance that later requests in the same session return to the provider endpoint holding a warm cache.
+- Caller-provided body `session_id`, header `x-session-id`, and `prompt_cache_key` are preserved. When a Claude request lacks a routing identifier, the proxy can derive a stable routing header from the model, `instructions`, the first leading system message, and tool definitions, using the local proxy token as an HMAC key. The derived key contains no plaintext prompt; later dynamic `developer` messages alone do not change this opening-prefix routing key. Custom cache-policy bodies can also receive a routing header while remaining unchanged. Sticky routing improves the probability of returning to the same provider endpoint.
 
 The local proxy does not maintain a local prompt-content cache. Every turn still uploads the complete request to OpenRouter; an upstream cache hit reuses the model's previously computed prompt prefix. The first request still reports the complete input-token count, and creating a Claude cache can cost more than ordinary input. To verify actual cache activity, inspect `usage.input_tokens_details.cached_tokens` and `cache_write_tokens` in the Responses usage object. A positive `cached_tokens` value indicates a cache read, while a positive `cache_write_tokens` value indicates a write. Total input tokens alone do not establish whether a cache hit occurred.
 
+**Cache markers cannot guarantee a hit on every request.** The first request must establish a cache. Expiration, changed prefixes or tools, provider changes, and inputs below the model's minimum cacheable length may require fresh processing or writes. The default remains five minutes to avoid automatically opting into the higher write price of one-hour caching. The proxy never prewarms, retries requests, or sends extra inference to test caching.
+
+### Inspect Claude Cache Status
+
+```powershell
+cxor -CacheStatus
+```
+
+This command requires an already-running V4 proxy and cannot be combined with `-SetKey` / `-AllModels`. It only reads the current local proxy's authenticated health response, performs no upstream inference or catalog refresh, and does not start or restart the proxy or Desktop. The report includes:
+
+- Claude request totals since this proxy process started, plus hit, write-only, miss, unknown, and upstream-rejected counts. Classifications are mutually exclusive: with valid input usage, positive cache reads indicate a hit; zero reads with positive writes indicate write-only; explicitly zero reads and writes indicate a miss. Insufficient usage evidence is unknown. A hit request may still report both read and write tokens.
+- The latest upstream-reported `InputTokens`, `CachedTokens`, `CacheWriteTokens`, `OutputTokens`, and `CostUSD`. Missing or unparseable fields remain `null` and are never replaced with zero. `CacheReadPercent` is the cached-read token percentage of the request's total input.
+- A separate `CompletionStatus`, such as `completed`, `incomplete`, `failed`, `transport_error`, or `unknown`. Upstream HTTP statuses of 400 or above are classified as `rejected`.
+- `SystemCacheCoverage` (`system_cache_coverage` in the health response), always `unknown`: aggregate usage can establish that some input was read from cache, but cannot prove that the complete system prompt was cached.
+
+The V4 proxy performs size-bounded side-channel usage parsing while forwarding the original response byte stream. It retains only aggregate counters and the latest usage in memory, with no per-request history. Counters reset when the proxy restarts; historical billing records are not imported. Unavailable usage remains unknown, and OpenRouter billing is authoritative for actual charges.
+
 Proxy state is stored at `<CODEX_HOME>\openrouter-cache-proxy.json`, which defaults to `%USERPROFILE%\.codex\openrouter-cache-proxy.json`. The file contains the process identity, loopback port, random local access token, start time, and module path. It contains no OpenRouter API key, prompt, or response data. If the computer restarts or the proxy exits, the OpenRouter provider's command authentication validates and self-heals the proxy on the configured port with the configured token before reading the current user's API key. `cx` keeps the proxy and state by default; `cx -StopProxy` and the uninstaller stop the process and remove the state file.
 
-For upstream non-success statuses, the proxy preserves the HTTP status and converts empty or legacy error bodies into an `error` object that Codex can read. Upstream 5xx responses are completed immediately with a safe status message so a broken gateway body cannot stall error reporting. Local forwarding failures return a fixed phase such as `send_upstream`, `copy_response_headers`, or `read_upstream`, with `x-cxor-error-source` identifying the source. The token-authenticated health check reports request and failure counts plus the latest sanitized source, fixed phase, upstream status, request byte count, and timestamp. Diagnostics contain no model, API key, local token, prompt, response body, query string, or exception text.
+For upstream non-success statuses, the proxy preserves the HTTP status and converts empty or legacy error bodies into an `error` object that Codex can read. Upstream 5xx responses are completed immediately with a safe status message so a broken gateway body cannot stall error reporting. Local forwarding failures return a fixed phase such as `send_upstream`, `copy_response_headers`, or `read_upstream`, with `x-cxor-error-source` identifying the source. The token-authenticated health check also reports request and failure counts plus the latest sanitized source, fixed phase, upstream status, request byte count, and timestamp. Diagnostics contain no model ID, API key, local token, prompt, response body, query string, or exception text.
 
 ## Updating and Uninstalling
 
@@ -126,21 +146,23 @@ The uninstaller stops the local proxy and removes its state, the user module, to
 - Empty `Content` errors, damaged CLI JSON, system-temp PATH alias warnings, or repeated stale-catalog warnings: update to version `0.1.8`. The catalog fixes force UTF-8 decoding for Codex CLI stdout and stderr, prioritize the direct OpenRouter catalog request, and use an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.
-- `502 Bad Gateway`: update to `0.1.10` and run `cxor` once. The V3 proxy reuses the existing loopback port when available and converts upstream 5xx responses into error objects Codex can read. Its authenticated health endpoint also exposes only sanitized failure source, fixed phase, and HTTP status diagnostics.
-- `cached_tokens` remains zero: confirm that successive requests have the same long prefix, use the same model and a stable `prompt_cache_key`, and satisfy the model's minimum cacheable length and lifetime. The proxy continues to forward requests safely when a model or upstream provider has no caching support.
+- `502 Bad Gateway`: install the current source version and run `cxor` once. The V4 proxy retains the 0.1.10 error-response fixes and reuses the existing loopback port when available. Its authenticated health endpoint also exposes sanitized failure source, fixed phase, and HTTP status diagnostics.
+- `cached_tokens` remains zero: run `cxor -CacheStatus` first to distinguish cache writes, confirmed misses, and unknown usage. Check for an identical long prefix, the same model, a stable routing identifier, and the model's minimum cacheable length and lifetime. A positive cached-read count alone cannot establish that the whole system prompt was cached.
+- Claude returns `402` or insufficient credits: the upstream credit check rejected the request. Available balance, in-flight reservations, and upstream admission checks can affect whether a request is accepted. This status does not establish a cache failure, and a possible cache discount cannot guarantee admission. Check the OpenRouter balance and in-flight requests before repeating a large-context request.
 
 ## Data and Security
 
-In OpenRouter mode, conversation requests first pass through a local proxy bound only to `127.0.0.1`, then go to OpenRouter through a fixed HTTPS endpoint and may continue to the selected model's downstream provider. The proxy accepts only requests carrying its random local access token, exposes only a health check and `/api/v1/responses`, disables upstream redirects, strips its local token before forwarding, and does not log API keys, prompts, or responses. It parses request bodies in memory only to decide whether to add the Claude cache field and streams response bytes back to Codex. See the [English security policy](SECURITY_EN.md) for API-key handling and other local changes.
+In OpenRouter mode, conversation requests first pass through a local proxy bound only to `127.0.0.1`, then go to OpenRouter through a fixed HTTPS endpoint and may continue to the selected model's downstream provider. The proxy accepts only requests carrying its random local access token, exposes only a health check and `/api/v1/responses`, disables upstream redirects, strips its local token before forwarding, and does not log API keys, prompts, or responses. It parses request bodies in memory to decide whether to add Claude cache fields and a derived routing key, streams response bytes back to Codex, and extracts usage through bounded in-memory parsing. Health diagnostics retain only numeric statistics and fixed statuses; responses are never written to disk. See the [English security policy](SECURITY_EN.md) for API-key handling and other local changes.
 
 ## Testing
 
 ```powershell
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
 pwsh -NoProfile -File .\tests\Run-ProxyIntegrationTests.ps1
+pwsh -NoProfile -File .\tests\Run-ClaudeCacheTests.ps1
 ```
 
-The automated test suite does not use a real API key, perform network inference, or restart Codex Desktop. Proxy integration tests use real loopback HTTP connections and an offline upstream stub to verify error delivery, SSE behavior, and sanitized diagnostics.
+The automated test suite does not use a real API key, perform network inference, or restart Codex Desktop. Proxy integration tests use real loopback HTTP connections and an offline upstream stub to verify error delivery, SSE behavior, and sanitized diagnostics. Claude cache tests use simulated usage to cover breakpoints, routing, custom-policy preservation, and status reporting. Offline results validate local logic; real cache hits and charges still require actual upstream usage records.
 
 ## References
 

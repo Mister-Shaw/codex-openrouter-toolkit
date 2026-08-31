@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes apply only to the current version, `0.1.10`. Users of older versions should update before checking whether an issue still occurs.
+Security fixes target the current source version, `0.1.11`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 
@@ -17,10 +17,11 @@ Security fixes apply only to the current version, `0.1.10`. Users of older versi
 
 ## Network and Models
 
-- Every `cxor` run connects to OpenRouter, attempts to synchronize the latest Codex-specific model information for the current Codex CLI version, and generates and validates a local model catalog.
+- Except for read-only `cxor -CacheStatus`, every `cxor` run connects to OpenRouter, attempts to synchronize the latest Codex-specific model information for the current Codex CLI version, and generates and validates a local model catalog.
 - A new catalog must contain exactly one `~openai/gpt-latest` entry. A catalog that does not meet this requirement is rejected before publication.
 - In OpenRouter mode, conversation requests pass through OpenRouter and may be sent to the downstream provider of the selected model. Handle sensitive data according to the policies of both services.
-- Every OpenRouter Responses request first passes through the local cache-aware proxy. The proxy adds a five-minute `ephemeral` top-level `cache_control` only to Claude requests that do not already define it. Other model requests retain their original bodies and use any automatic caching supported upstream. Provider-side prompt caching temporarily retains prompt prefixes in provider infrastructure; retention, billing, and data-policy details vary by model and endpoint.
+- Every OpenRouter Responses request first passes through the local cache-aware proxy. Claude requests without a custom cache policy receive top-level default five-minute `ephemeral` caching and up to two breakpoints on the first and last eligible messages in the initial consecutive system/developer section. Prompt text, roles, ordering, `instructions`, and tools are preserved. Claude requests with existing cache policies and other model requests retain their original bodies. Provider-side prompt caching temporarily retains prompt prefixes in provider infrastructure; retention, billing, and data-policy details vary by model and endpoint.
+- Existing body `session_id`, header `x-session-id`, and `prompt_cache_key` are preserved. A Claude request without a routing identifier can receive an HMAC-derived routing header based on the model, `instructions`, the first system message, and tools, keyed by the local proxy token. The derived value contains no plaintext prompt, and the local token is never sent directly upstream. The proxy never automatically prewarms or retries inference. Cache markers and routing keys provide no guarantee of a hit or a particular charge.
 - The toolkit sets every model's `base_instructions` and `model_messages.instructions_template` fields to empty strings. Codex Desktop continues to provide developer context, tool definitions, and permission controls. Responses API and tool support still vary by model.
 - A failed refresh or validation never overwrites the last valid catalog. When a valid previous catalog exists, it is revalidated, reused, and accompanied by a warning. If every source fails, the switch is aborted before the running Codex Desktop process is closed.
 
@@ -28,7 +29,9 @@ Security fixes apply only to the current version, `0.1.10`. Users of older versi
 
 The installer places the module in the current user's PowerShell module directory and removes legacy toolkit blocks from the PowerShell profile. Installation does not modify Codex configuration.
 
-Running `cxor` writes `<CODEX_HOME>/openrouter-model-catalog.json` and `<CODEX_HOME>/openrouter-cache-proxy.json`, starts a background PowerShell proxy bound only to a random high port on `127.0.0.1`, and adds the toolkit-managed OpenRouter configuration to `config.toml`. The TOML and proxy state file contain a randomly generated 256-bit local proxy token. This token only guards the loopback listener against accidental local use and carries no OpenRouter account authority.
+Except with `-CacheStatus`, running `cxor` writes `<CODEX_HOME>/openrouter-model-catalog.json` and `<CODEX_HOME>/openrouter-cache-proxy.json`, starts a background PowerShell proxy bound only to a random high port on `127.0.0.1`, and adds the toolkit-managed OpenRouter configuration to `config.toml`. The TOML and proxy state file contain a randomly generated 256-bit local proxy token. This token protects the loopback listener and keys the fallback Claude routing HMAC; it carries no OpenRouter account authority.
+
+`cxor -CacheStatus` only reads the current proxy's authenticated health endpoint. It calls no model, refreshes no catalog, and does not start or restart the proxy or Desktop. The V4 proxy performs bounded in-memory response parsing while forwarding the original bytes. Health diagnostics retain aggregate counters, the latest numeric token/cost values, and fixed statuses, with no model IDs, prompts, response bodies, or per-request history. Statistics disappear when the proxy exits and are never written to its state file. Missing or unparseable usage remains unknown; aggregate statistics cannot prove that the entire system prompt was cached.
 
 Running `cx` removes `model`, `model_provider`, `model_reasoning_effort`, `model_catalog_json`, and the managed OpenRouter provider while preserving other configuration. The verified background proxy and state file remain available to OpenRouter tasks that are already open. Running `cx -StopProxy` or the uninstaller stops the proxy and removes its state; the uninstaller also removes the catalog.
 
