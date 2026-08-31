@@ -539,7 +539,7 @@ function Commit-CxConfigChange {
 }
 
 function Initialize-CxProxyType {
-    if ('CodexOpenRouter.OpenRouterCacheProxyV2' -as [type]) { return }
+    if ('CodexOpenRouter.OpenRouterCacheProxyV3' -as [type]) { return }
 
     $source = @'
 using System;
@@ -556,7 +556,7 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter
 {
-    public static class OpenRouterCacheProxyV2
+    public static class OpenRouterCacheProxyV3
     {
         private const int MaximumRequestBytes = 64 * 1024 * 1024;
         private const int MaximumErrorResponseBytes = 1024 * 1024;
@@ -729,6 +729,15 @@ namespace CodexOpenRouter
             private readonly HttpListener listener;
             private readonly HttpClient client;
             private readonly string token;
+            private readonly object diagnosticsSync = new object();
+            private long totalRequests;
+            private long totalFailures;
+            private string lastErrorSource = string.Empty;
+            private string lastErrorCode = string.Empty;
+            private string lastErrorPhase = string.Empty;
+            private int lastUpstreamStatus;
+            private int lastRequestBytes;
+            private string lastErrorUtc = string.Empty;
 
             internal ProxyServer(int port, string token)
             {
@@ -796,6 +805,12 @@ namespace CodexOpenRouter
                 }
                 catch (JsonException)
                 {
+                    RecordFailure(
+                        requestState,
+                        "local",
+                        "invalid_json",
+                        requestState.Phase,
+                        0);
                     await WriteErrorAsync(
                         context.Response,
                         400,
@@ -806,6 +821,12 @@ namespace CodexOpenRouter
                 }
                 catch (DecoderFallbackException)
                 {
+                    RecordFailure(
+                        requestState,
+                        "local",
+                        "invalid_utf8",
+                        requestState.Phase,
+                        0);
                     await WriteErrorAsync(
                         context.Response,
                         400,
@@ -816,6 +837,12 @@ namespace CodexOpenRouter
                 }
                 catch (RequestTooLargeException)
                 {
+                    RecordFailure(
+                        requestState,
+                        "local",
+                        "request_too_large",
+                        requestState.Phase,
+                        0);
                     await WriteErrorAsync(
                         context.Response,
                         413,
@@ -826,6 +853,12 @@ namespace CodexOpenRouter
                 }
                 catch (Exception)
                 {
+                    RecordFailure(
+                        requestState,
+                        "local",
+                        requestState.Phase,
+                        requestState.Phase,
+                        requestState.UpstreamStatus);
                     if (!requestState.ResponseStarted)
                     {
                         await WriteErrorAsync(
@@ -835,10 +868,21 @@ namespace CodexOpenRouter
                             "cxor_proxy_error",
                             requestState.Phase).ConfigureAwait(false);
                     }
+                    else
+                    {
+                        requestState.AbortResponse = true;
+                    }
                 }
                 finally
                 {
-                    try { context.Response.Close(); } catch { }
+                    if (requestState.AbortResponse)
+                    {
+                        try { context.Response.Abort(); } catch { }
+                    }
+                    else
+                    {
+                        try { context.Response.Close(); } catch { }
+                    }
                 }
             }
 
@@ -864,9 +908,7 @@ namespace CodexOpenRouter
                 if (string.Equals(path, "/__cxor/health", StringComparison.Ordinal) &&
                     string.Equals(incoming.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    byte[] health = Encoding.UTF8.GetBytes(
-                        "{\"status\":\"ok\",\"schema\":2,\"pid\":" +
-                        Environment.ProcessId.ToString() + "}");
+                    byte[] health = CreateHealthBody();
                     outgoing.StatusCode = 200;
                     outgoing.ContentType = "application/json; charset=utf-8";
                     outgoing.ContentLength64 = health.Length;
@@ -888,11 +930,19 @@ namespace CodexOpenRouter
                     return;
                 }
 
+                Interlocked.Increment(ref totalRequests);
+
                 if (incoming.ContentType == null ||
                     !incoming.ContentType.StartsWith(
                         "application/json",
                         StringComparison.OrdinalIgnoreCase))
                 {
+                    RecordFailure(
+                        requestState,
+                        "local",
+                        "unsupported_content_type",
+                        "validate_request",
+                        0);
                     await WriteErrorAsync(
                         outgoing,
                         415,
@@ -905,6 +955,7 @@ namespace CodexOpenRouter
 
                 requestState.Phase = "read_request";
                 byte[] requestBody = await ReadBodyAsync(incoming).ConfigureAwait(false);
+                requestState.RequestBytes = requestBody.Length;
                 requestState.Phase = "rewrite_request";
                 byte[] upstreamBody = RewriteRequestBody(requestBody);
                 string query = incoming.Url == null ? string.Empty : incoming.Url.Query;
@@ -930,22 +981,15 @@ namespace CodexOpenRouter
                         HttpCompletionOption.ResponseHeadersRead,
                         cancellation.Token).ConfigureAwait(false))
                     {
-                        outgoing.StatusCode = (int)upstream.StatusCode;
-                        outgoing.KeepAlive = false;
+                        requestState.UpstreamStatus = (int)upstream.StatusCode;
                         requestState.Phase = "copy_response_headers";
 
                         if (!upstream.IsSuccessStatusCode)
                         {
                             CopyErrorResponseHeaders(upstream, outgoing);
                             requestState.Phase = "read_upstream_error";
-                            byte[] rawError;
-                            using (var errorCancellation =
-                                new CancellationTokenSource(TimeSpan.FromSeconds(15)))
-                            {
-                                rawError = await ReadErrorBodyAsync(
-                                    upstream.Content,
-                                    errorCancellation.Token).ConfigureAwait(false);
-                            }
+                            byte[] rawError = await ReadSafeErrorBodyAsync(
+                                upstream).ConfigureAwait(false);
                             string errorText;
                             try
                             {
@@ -959,23 +1003,30 @@ namespace CodexOpenRouter
                                 NormalizeUpstreamErrorJson(
                                     errorText,
                                     (int)upstream.StatusCode));
-                            outgoing.SendChunked = false;
-                            outgoing.ContentType = "application/json; charset=utf-8";
-                            outgoing.ContentLength64 = normalizedError.Length;
-                            TrySetResponseHeader(outgoing, ErrorSourceHeader, "upstream");
-                            TrySetResponseHeader(
-                                outgoing,
-                                ErrorCodeHeader,
-                                "upstream_http_" + ((int)upstream.StatusCode).ToString());
+                            string upstreamCode = "upstream_http_" +
+                                ((int)upstream.StatusCode).ToString();
+                            RecordFailure(
+                                requestState,
+                                "upstream",
+                                upstreamCode,
+                                "upstream_response",
+                                (int)upstream.StatusCode);
                             requestState.Phase = "write_downstream_error";
-                            requestState.ResponseStarted = true;
-                            await outgoing.OutputStream.WriteAsync(
+                            bool wroteError = TryCompleteJsonError(
+                                outgoing,
+                                (int)upstream.StatusCode,
                                 normalizedError,
-                                0,
-                                normalizedError.Length).ConfigureAwait(false);
+                                "upstream",
+                                upstreamCode,
+                                false);
+                            if (!wroteError)
+                                throw new IOException("Downstream error response write failed.");
+                            requestState.ResponseStarted = true;
                             return;
                         }
 
+                        outgoing.StatusCode = (int)upstream.StatusCode;
+                        outgoing.KeepAlive = false;
                         CopyResponseHeaders(upstream, outgoing);
                         outgoing.SendChunked = true;
 
@@ -1006,6 +1057,79 @@ namespace CodexOpenRouter
                             }
                         }
                     }
+                }
+            }
+
+            private byte[] CreateHealthBody()
+            {
+                var health = new JsonObject
+                {
+                    ["status"] = "ok",
+                    ["schema"] = 3,
+                    ["pid"] = Environment.ProcessId,
+                    ["total_requests"] = Interlocked.Read(ref totalRequests),
+                    ["total_failures"] = Interlocked.Read(ref totalFailures)
+                };
+                lock (diagnosticsSync)
+                {
+                    health["last_error_source"] = lastErrorSource;
+                    health["last_error_code"] = lastErrorCode;
+                    health["last_error_phase"] = lastErrorPhase;
+                    health["last_upstream_status"] = lastUpstreamStatus;
+                    health["last_request_bytes"] = lastRequestBytes;
+                    health["last_error_utc"] = lastErrorUtc;
+                }
+                return Encoding.UTF8.GetBytes(
+                    health.ToJsonString(
+                        new JsonSerializerOptions { WriteIndented = false }));
+            }
+
+            private void RecordFailure(
+                ProxyRequestState requestState,
+                string source,
+                string code,
+                string phase,
+                int upstreamStatus)
+            {
+                if (!requestState.FailureRecorded)
+                {
+                    requestState.FailureRecorded = true;
+                    Interlocked.Increment(ref totalFailures);
+                }
+                lock (diagnosticsSync)
+                {
+                    lastErrorSource = source ?? string.Empty;
+                    lastErrorCode = code ?? string.Empty;
+                    lastErrorPhase = phase ?? string.Empty;
+                    lastUpstreamStatus = upstreamStatus;
+                    lastRequestBytes = requestState.RequestBytes;
+                    lastErrorUtc = DateTimeOffset.UtcNow.ToString("O");
+                }
+            }
+
+            private static async Task<byte[]> ReadSafeErrorBodyAsync(
+                HttpResponseMessage upstream)
+            {
+                if ((int)upstream.StatusCode >= 500) return Array.Empty<byte>();
+                long? contentLength = upstream.Content.Headers.ContentLength;
+                if (contentLength.HasValue &&
+                    (contentLength.Value <= 0 ||
+                    contentLength.Value > MaximumErrorResponseBytes))
+                    return Array.Empty<byte>();
+
+                try
+                {
+                    using (var cancellation =
+                        new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                    {
+                        return await ReadErrorBodyAsync(
+                            upstream.Content,
+                            cancellation.Token).ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    return Array.Empty<byte>();
                 }
             }
 
@@ -1151,28 +1275,47 @@ namespace CodexOpenRouter
                     CryptographicOperations.FixedTimeEquals(left, right);
             }
 
-            private static async Task WriteErrorAsync(
+            private static Task WriteErrorAsync(
                 HttpListenerResponse response,
                 int statusCode,
                 string message,
                 string type,
                 string code)
             {
+                byte[] body = Encoding.UTF8.GetBytes(CreateErrorJson(message, type, code));
+                TryCompleteJsonError(
+                    response,
+                    statusCode,
+                    body,
+                    "local",
+                    code,
+                    true);
+                return Task.CompletedTask;
+            }
+
+            private static bool TryCompleteJsonError(
+                HttpListenerResponse response,
+                int statusCode,
+                byte[] body,
+                string source,
+                string code,
+                bool clearHeaders)
+            {
+                if (clearHeaders)
+                {
+                    try { response.Headers.Clear(); } catch { }
+                }
+                try { response.StatusCode = statusCode; } catch { }
+                TrySetResponseHeader(response, ErrorSourceHeader, source);
+                TrySetResponseHeader(response, ErrorCodeHeader, code);
+                try { response.ContentType = "application/json; charset=utf-8"; } catch { }
+                try { response.KeepAlive = false; } catch { }
                 try
                 {
-                    if (response.OutputStream == null) return;
-                    byte[] body = Encoding.UTF8.GetBytes(CreateErrorJson(message, type, code));
-                    try { response.Headers.Clear(); } catch { }
-                    response.StatusCode = statusCode;
-                    response.SendChunked = false;
-                    response.ContentType = "application/json; charset=utf-8";
-                    response.ContentLength64 = body.Length;
-                    TrySetResponseHeader(response, ErrorSourceHeader, "local");
-                    TrySetResponseHeader(response, ErrorCodeHeader, code);
-                    await response.OutputStream.WriteAsync(body, 0, body.Length)
-                        .ConfigureAwait(false);
+                    response.Close(body, true);
+                    return true;
                 }
-                catch { }
+                catch { return false; }
             }
 
             public void Dispose()
@@ -1188,6 +1331,10 @@ namespace CodexOpenRouter
             {
                 internal string Phase { get; set; } = "accept_request";
                 internal bool ResponseStarted { get; set; }
+                internal bool AbortResponse { get; set; }
+                internal bool FailureRecorded { get; set; }
+                internal int RequestBytes { get; set; }
+                internal int UpstreamStatus { get; set; }
             }
         }
     }
@@ -1205,7 +1352,7 @@ function Start-CxProxyServer {
         throw '缓存代理缺少有效的启动令牌。'
     }
     Initialize-CxProxyType
-    [CodexOpenRouter.OpenRouterCacheProxyV2]::RunAsync($Port, $token).
+    [CodexOpenRouter.OpenRouterCacheProxyV3]::RunAsync($Port, $token).
         GetAwaiter().GetResult()
 }
 
@@ -1245,7 +1392,7 @@ function Get-CxProxyState {
     }
     catch { return $null }
     $started = [DateTimeOffset]::MinValue
-    if ($schema -notin @(1, 2) -or
+    if ($schema -notin @(1, 2, 3) -or
         $processId -le 0 -or
         $port -lt 1024 -or $port -gt 65535 -or
         [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
@@ -1299,7 +1446,7 @@ function Test-CxProxyHealthContent {
     try { $health = $Content | ConvertFrom-Json -ErrorAction Stop }
     catch { return $false }
     return [string]$health.status -ceq 'ok' -and
-        [int]$health.schema -eq 2 -and
+        [int]$health.schema -eq 3 -and
         [int]$health.pid -eq $ExpectedProcessId
 }
 
@@ -1423,7 +1570,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
         }
 
         $stateContent = [ordered]@{
-            schema = 2
+            schema = 3
             pid = $process.Id
             port = $Port
             token = $Token

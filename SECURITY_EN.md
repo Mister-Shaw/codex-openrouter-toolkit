@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes apply only to the current version, `0.1.9`. Users of older versions should update before checking whether an issue still occurs.
+Security fixes apply only to the current version, `0.1.10`. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 

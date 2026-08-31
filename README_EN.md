@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.9`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.10`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -104,7 +104,7 @@ The local proxy does not maintain a local prompt-content cache. Every turn still
 
 Proxy state is stored at `<CODEX_HOME>\openrouter-cache-proxy.json`, which defaults to `%USERPROFILE%\.codex\openrouter-cache-proxy.json`. The file contains the process identity, loopback port, random local access token, start time, and module path. It contains no OpenRouter API key, prompt, or response data. If the computer restarts or the proxy exits, the OpenRouter provider's command authentication validates and self-heals the proxy on the configured port with the configured token before reading the current user's API key. `cx` keeps the proxy and state by default; `cx -StopProxy` and the uninstaller stop the process and remove the state file.
 
-For upstream non-success statuses, the proxy preserves the HTTP status and converts empty or legacy error bodies into an `error` object that Codex can read. Local forwarding failures return a fixed phase such as `send_upstream`, `copy_response_headers`, or `read_upstream`, with `x-cxor-error-source` identifying the source. Local phase diagnostics contain no API key, prompt, response body, query string, or exception stack.
+For upstream non-success statuses, the proxy preserves the HTTP status and converts empty or legacy error bodies into an `error` object that Codex can read. Upstream 5xx responses are completed immediately with a safe status message so a broken gateway body cannot stall error reporting. Local forwarding failures return a fixed phase such as `send_upstream`, `copy_response_headers`, or `read_upstream`, with `x-cxor-error-source` identifying the source. The token-authenticated health check reports request and failure counts plus the latest sanitized source, fixed phase, upstream status, request byte count, and timestamp. Diagnostics contain no model, API key, local token, prompt, response body, query string, or exception text.
 
 ## Updating and Uninstalling
 
@@ -126,7 +126,7 @@ The uninstaller stops the local proxy and removes its state, the user module, to
 - Empty `Content` errors, damaged CLI JSON, system-temp PATH alias warnings, or repeated stale-catalog warnings: update to version `0.1.8`. The catalog fixes force UTF-8 decoding for Codex CLI stdout and stderr, prioritize the direct OpenRouter catalog request, and use an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.
-- `502 Bad Gateway`: update to `0.1.9`, run `cxor` again from a regular PowerShell 7 window, and create a new task. The revised error body distinguishes an upstream OpenRouter HTTP status from a local proxy phase. A background proxy launched inside a Codex sandbox may inherit restricted TLS credentials.
+- `502 Bad Gateway`: update to `0.1.10` and run `cxor` once. The V3 proxy reuses the existing loopback port when available and converts upstream 5xx responses into error objects Codex can read. Its authenticated health endpoint also exposes only sanitized failure source, fixed phase, and HTTP status diagnostics.
 - `cached_tokens` remains zero: confirm that successive requests have the same long prefix, use the same model and a stable `prompt_cache_key`, and satisfy the model's minimum cacheable length and lifetime. The proxy continues to forward requests safely when a model or upstream provider has no caching support.
 
 ## Data and Security
@@ -137,9 +137,10 @@ In OpenRouter mode, conversation requests first pass through a local proxy bound
 
 ```powershell
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
+pwsh -NoProfile -File .\tests\Run-ProxyIntegrationTests.ps1
 ```
 
-The automated test suite does not use a real API key, perform network inference, or restart Codex Desktop.
+The automated test suite does not use a real API key, perform network inference, or restart Codex Desktop. Proxy integration tests use real loopback HTTP connections and an offline upstream stub to verify error delivery, SSE behavior, and sanitized diagnostics.
 
 ## References
 

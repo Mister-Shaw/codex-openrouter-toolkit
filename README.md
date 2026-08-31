@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.9`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.10`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -104,7 +104,7 @@ OpenRouter 模式下，Codex 发往 OpenRouter Responses API 的所有请求都�
 
 代理状态保存在 `<CODEX_HOME>\openrouter-cache-proxy.json`，默认位置为 `%USERPROFILE%\.codex\openrouter-cache-proxy.json`。状态文件记录进程、环回端口、随机本地访问令牌、启动时间和模块路径，不保存 OpenRouter API Key、提示或响应。电脑重启或代理退出后，OpenRouter provider 的 command-auth 会先校验并按原端口与令牌自愈代理，再读取当前用户的 API Key。`cx` 默认保留代理与状态，`cx -StopProxy` 和卸载器会停止代理并删除状态文件。
 
-代理收到上游非成功状态时会保留 HTTP 状态，并把空白或旧式错误正文转换为 Codex 可读取的 `error` 对象。本地转发异常会返回固定阶段码，例如 `send_upstream`、`copy_response_headers` 或 `read_upstream`，同时通过 `x-cxor-error-source` 标明来源。本地阶段诊断不包含 API Key、提示、响应正文、查询串或异常堆栈。
+代理收到上游非成功状态时会保留 HTTP 状态，并把空白或旧式错误正文转换为 Codex 可读取的 `error` 对象。上游 5xx 会立即使用安全的状态消息完成响应，避免等待异常网关正文。本地转发异常会返回固定阶段码，例如 `send_upstream`、`copy_response_headers` 或 `read_upstream`，同时通过 `x-cxor-error-source` 标明来源。带本地令牌的健康检查会报告请求/失败计数、最近错误来源、固定阶段、上游状态、请求字节数和时间。诊断不包含模型、API Key、本地令牌、提示、响应正文、查询串或异常文本。
 
 ## 更新与卸载
 
@@ -126,7 +126,7 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 - 遇到 `Content` 为空、CLI JSON 损坏、系统临时目录 PATH alias 警告或持续显示旧目录告警：升级到 `0.1.8`；目录同步修复会固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。
-- 出现 `502 Bad Gateway`：升级到 `0.1.9`，在普通 PowerShell 7 窗口重新运行 `cxor`，再创建新任务。新错误正文会区分 OpenRouter 上游 HTTP 状态与本地代理处理阶段；从 Codex 沙箱内启动的后台代理可能继承受限 TLS 环境。
+- 出现 `502 Bad Gateway`：升级到 `0.1.10`，再运行一次 `cxor`。V3 代理会优先按旧地址轮换代理，并把上游 5xx 转换为 Codex 可读取的错误对象；认证健康检查同时提供脱敏的最近失败来源、固定阶段和 HTTP 状态。
 - `cached_tokens` 持续为 0：确认连续请求具有相同的长前缀、使用相同模型与稳定的 `prompt_cache_key`，并满足模型的最小可缓存长度和有效期要求。模型或下游不支持缓存时，代理会继续安全转发请求。
 
 ## 数据与安全
@@ -137,9 +137,10 @@ OpenRouter 模式下，对话请求会先经过仅监听 `127.0.0.1` 的本地�
 
 ```powershell
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
+pwsh -NoProfile -File .\tests\Run-ProxyIntegrationTests.ps1
 ```
 
-自动测试不使用真实 API Key，也不执行联网推理或桌面端重启。
+自动测试不使用真实 API Key，也不执行联网推理或桌面端重启。代理集成测试使用真实本地环回 HTTP 连接和离线上游替身，验证错误回包、SSE 与脱敏诊断。
 
 ## 参考
 

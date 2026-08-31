@@ -354,15 +354,15 @@ $sourcePackage = if (Test-Path -LiteralPath $sourceRoot -PathType Container) {
 }
 else { $null }
 if (-not $sourcePackage) {
-    throw '找不到可用于安全清理配置的 CodexOpenRouter 0.1.9 模块。'
+    throw '找不到可用于安全清理配置的 CodexOpenRouter 0.1.10 模块。'
 }
 $sourceData = Import-PowerShellDataFile -LiteralPath $sourcePackage.ManifestPath
 $sourceExports = @($sourceData.FunctionsToExport)
-if ([version]$sourceData.ModuleVersion -ne [version]'0.1.9' -or
+if ([version]$sourceData.ModuleVersion -ne [version]'0.1.10' -or
     $sourceExports.Count -ne 2 -or
     $sourceExports -cnotcontains 'cx' -or
     $sourceExports -cnotcontains 'cxor') {
-    throw '配置清理模块必须是 0.1.9，且只能导出 cx 与 cxor。'
+    throw '配置清理模块必须是 0.1.10，且只能导出 cx 与 cxor。'
 }
 $moduleManifest = $sourcePackage.ManifestPath
 
