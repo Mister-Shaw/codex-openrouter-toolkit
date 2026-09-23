@@ -552,7 +552,7 @@ function Commit-CxConfigChange {
 }
 
 function Initialize-CxProxyType {
-    if ('CodexOpenRouter.OpenRouterCacheProxyV5' -as [type]) { return }
+    if ('CodexOpenRouter.OpenRouterCacheProxyV6' -as [type]) { return }
 
     $source = @'
 using System;
@@ -569,7 +569,7 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter
 {
-    public static class OpenRouterCacheProxyV5
+    public static class OpenRouterCacheProxyV6
     {
         private const int MaximumRequestBytes = 64 * 1024 * 1024;
         private const int MaximumErrorResponseBytes = 1024 * 1024;
@@ -644,18 +644,7 @@ namespace CodexOpenRouter
             if (!IsClaudeModel(model) || HasCachePolicy(request))
                 return body;
 
-            List<JsonObject> prefix = GetSystemPrefixMessages(request);
-            JsonObject first = null;
-            JsonObject last = null;
-            foreach (JsonObject message in prefix)
-            {
-                JsonObject block = GetLastSystemTextBlock(message, true);
-                if (block == null) continue;
-                if (first == null) first = block;
-                last = block;
-            }
-            if (first != null) AddSystemBreakpoint(first);
-            if (last != null && !ReferenceEquals(first, last)) AddSystemBreakpoint(last);
+            // Let the upstream service advance the cache boundary as the conversation grows.
             request.Add(
                 "cache_control",
                 new JsonObject { ["type"] = "ephemeral" });
@@ -722,42 +711,6 @@ namespace CodexOpenRouter
             return result;
         }
 
-        private static bool HasEligibleSystemPrefix(JsonObject request)
-        {
-            foreach (JsonObject message in GetSystemPrefixMessages(request))
-                if (GetLastSystemTextBlock(message, false) != null ||
-                    !string.IsNullOrWhiteSpace(ReadJsonString(message, "content"))) return true;
-            return false;
-        }
-
-        private static JsonObject GetLastSystemTextBlock(JsonObject message, bool normalizeString)
-        {
-            string text = ReadJsonString(message, "content");
-            if (text != null && normalizeString)
-            {
-                // Only normalize the documented string shorthand; never change text or role.
-                var block = new JsonObject { ["type"] = "input_text", ["text"] = text };
-                message["content"] = new JsonArray(block);
-                return string.IsNullOrWhiteSpace(text) ? null : block;
-            }
-            JsonArray content = message["content"] as JsonArray;
-            if (content == null) return null;
-            JsonObject last = null;
-            foreach (JsonNode item in content)
-            {
-                JsonObject block = item as JsonObject;
-                if (ReadJsonString(block, "type") == "input_text" &&
-                    !string.IsNullOrWhiteSpace(ReadJsonString(block, "text"))) last = block;
-            }
-            return last;
-        }
-
-        private static void AddSystemBreakpoint(JsonObject block)
-        {
-            // Responses uses this marker; OpenRouter translates it to Claude's 5m cache.
-            block["prompt_cache_breakpoint"] = new JsonObject { ["mode"] = "explicit" };
-        }
-
         public static string GetClaudeRoutingKey(string json, string secret)
         {
             JsonObject request = JsonNode.Parse(json, null,
@@ -791,7 +744,11 @@ namespace CodexOpenRouter
             if (prefix.Count > 0)
             {
                 JsonObject message = (JsonObject)prefix[0].DeepClone();
-                GetLastSystemTextBlock(message, true);
+                // Normalize only the routing copy; leave the forwarded request untouched.
+                string text = ReadJsonString(message, "content");
+                if (text != null)
+                    message["content"] = new JsonArray(
+                        new JsonObject { ["type"] = "input_text", ["text"] = text });
                 RemoveCacheMarkers(message);
                 identity["system_prefix"] = message;
             }
@@ -1398,9 +1355,7 @@ namespace CodexOpenRouter
                 requestState.IsClaude = IsClaudeModel(ReadJsonString(originalRequest, "model"));
                 if (requestState.IsClaude)
                 {
-                    requestState.CachePolicy = HasCachePolicy(originalRequest) ? "caller_policy" :
-                        (HasEligibleSystemPrefix(originalRequest) ?
-                            "system_prefix" : "automatic_only");
+                    requestState.CachePolicy = HasCachePolicy(originalRequest) ? "caller_policy" : "automatic";
                 }
                 byte[] upstreamBody = RewriteRequestBody(requestBody, originalRequest);
                 string query = incoming.Url == null ? string.Empty : incoming.Url.Query;
@@ -1528,7 +1483,7 @@ namespace CodexOpenRouter
                 var health = new JsonObject
                 {
                     ["status"] = "ok",
-                    ["schema"] = 5,
+                    ["schema"] = 6,
                     ["pid"] = Environment.ProcessId,
                     ["total_requests"] = Interlocked.Read(ref totalRequests),
                     ["total_failures"] = Interlocked.Read(ref totalFailures)
@@ -1864,7 +1819,7 @@ function Start-CxProxyServer {
         throw '缓存代理缺少有效的启动令牌。'
     }
     Initialize-CxProxyType
-    [CodexOpenRouter.OpenRouterCacheProxyV5]::RunAsync($Port, $token).
+    [CodexOpenRouter.OpenRouterCacheProxyV6]::RunAsync($Port, $token).
         GetAwaiter().GetResult()
 }
 
@@ -1904,7 +1859,7 @@ function Get-CxProxyState {
     }
     catch { return $null }
     $started = [DateTimeOffset]::MinValue
-    if ($schema -notin @(1, 2, 3, 4, 5) -or
+    if ($schema -notin @(1, 2, 3, 4, 5, 6) -or
         $processId -le 0 -or
         $port -lt 1024 -or $port -gt 65535 -or
         [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
@@ -1958,7 +1913,7 @@ function Test-CxProxyHealthContent {
     try { $health = $Content | ConvertFrom-Json -ErrorAction Stop }
     catch { return $false }
     return [string]$health.status -ceq 'ok' -and
-        [int]$health.schema -eq 5 -and
+        [int]$health.schema -eq 6 -and
         [int]$health.pid -eq $ExpectedProcessId
 }
 
@@ -2018,7 +1973,7 @@ function Get-CxClaudeCacheStatus {
     if ($null -eq $state -or -not (Test-CxProxyProcess $state)) {
         throw '没有运行中的缓存代理。请先运行 cxor；此查询不会启动代理或调用模型。'
     }
-    if ($state.Schema -ne 5) {
+    if ($state.Schema -ne 6) {
         throw '当前代理版本较旧。请运行一次 cxor 以加载新版代理。'
     }
     $handler = [Net.Http.HttpClientHandler]::new()
@@ -2146,7 +2101,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
         }
 
         $stateContent = [ordered]@{
-            schema = 5
+            schema = 6
             pid = $process.Id
             port = $Port
             token = $Token

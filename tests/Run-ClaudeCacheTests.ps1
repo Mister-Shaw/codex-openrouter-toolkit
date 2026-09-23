@@ -39,12 +39,12 @@ function Convert-FixtureJson {
 
 function Rewrite-Fixture {
     param([string]$Json)
-    return [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson($Json)
+    return [CodexOpenRouter.OpenRouterCacheProxyV6]::RewriteRequestJson($Json)
 }
 
 function Get-FixtureKey {
     param([string]$Json, [string]$Secret = 'offline-secret-never-valid')
-    return [CodexOpenRouter.OpenRouterCacheProxyV5]::GetClaudeRoutingKey($Json, $Secret)
+    return [CodexOpenRouter.OpenRouterCacheProxyV6]::GetClaudeRoutingKey($Json, $Secret)
 }
 
 function Get-FixtureUsage {
@@ -54,7 +54,7 @@ function Get-FixtureUsage {
         [int]$ChunkSize = 7,
         [switch]$WithoutComplete
     )
-    $observer = [CodexOpenRouter.OpenRouterCacheProxyV5+CacheUsageObserver]::new($EventStream)
+    $observer = [CodexOpenRouter.OpenRouterCacheProxyV6+CacheUsageObserver]::new($EventStream)
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
     for ($offset = 0; $offset -lt $bytes.Length; $offset += $ChunkSize) {
         $count = [Math]::Min($ChunkSize, $bytes.Length - $offset)
@@ -86,7 +86,7 @@ try {
     $module = Get-Module CodexOpenRouter -ErrorAction Stop
     & $module { Initialize-CxProxyType }
 
-    Invoke-TestCase 'Leading system prefix gets stable first and last breakpoints' {
+    Invoke-TestCase 'Automatic caching adds only the top-level cache control' {
         $original = [ordered]@{
             model = 'anthropic/claude-opus-5'
             instructions = "fixed instruction`nwith Unicode 你好"
@@ -103,75 +103,35 @@ try {
             )
             stream = $true
         }
-        $rewritten = Rewrite-Fixture (Convert-FixtureJson $original) | ConvertFrom-Json
-        Assert-Equal $rewritten.cache_control.type 'ephemeral' 'Claude enables ephemeral automatic caching'
-        Assert-True ($null -eq $rewritten.cache_control.PSObject.Properties['ttl'] -or
-            $rewritten.cache_control.ttl -ceq '5m') 'Automatic caching keeps the five-minute default'
-        Assert-Equal $rewritten.instructions $original.instructions 'Instructions stay in the original field'
-        Assert-Equal (Convert-FixtureJson $rewritten.tools) (Convert-FixtureJson $original.tools) 'Tools stay unchanged'
-        Assert-Equal $rewritten.input.Count 5 'Message count is preserved'
-        Assert-Equal (($rewritten.input | ForEach-Object role) -join ',') `
-            'system,developer,developer,user,developer' 'All roles remain in original order'
-        Assert-Equal $rewritten.input[0].content[0].type 'input_text' 'String content gets an equivalent text block'
-        Assert-Equal $rewritten.input[0].content[0].text 'stable base' 'String text is preserved'
-        Assert-Equal $rewritten.input[0].content[0].prompt_cache_breakpoint.mode 'explicit' 'First prefix text is marked'
-        Assert-True ($null -eq $rewritten.input[1].content[0].PSObject.Properties['prompt_cache_breakpoint']) `
-            'Middle prefix text consumes no extra explicit breakpoint'
-        Assert-Equal $rewritten.input[2].content[0].prompt_cache_breakpoint.mode 'explicit' 'Last prefix text is marked'
-        Assert-Equal $rewritten.input[2].content[0].annotation 'preserve' 'Text-block extension fields survive'
-        Assert-Equal $rewritten.input[2].content[1].image_url 'https://example.invalid/image.png' 'Non-text blocks survive'
-        Assert-Equal $rewritten.input[3].content 'question one' 'User content stays in its original representation'
-        Assert-Equal $rewritten.input[4].content 'later dynamic rule' 'Later developer messages are untouched'
-        Assert-Equal $rewritten.stream $true 'Streaming setting is preserved'
+        $originalJson = Convert-FixtureJson $original
+        $rewritten = Rewrite-Fixture $originalJson | ConvertFrom-Json
+        Assert-Equal (Convert-FixtureJson $rewritten.cache_control) '{"type":"ephemeral"}' `
+            'Claude enables automatic caching with the default five-minute lifetime'
+        $rewritten.PSObject.Properties.Remove('cache_control')
+        Assert-Equal (Convert-FixtureJson $rewritten) $originalJson `
+            'All original fields and content representations remain unchanged'
     }
 
-    Invoke-TestCase 'One eligible prefix message has one breakpoint and rewriting is idempotent' {
+    Invoke-TestCase 'Automatic caching recognizes Claude aliases and rewriting is idempotent' {
         $json = '{"model":"~Anthropic/Claude-Sonnet-Latest","input":[{"role":"developer","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]},{"role":"user","content":"hi"}]}'
         $once = Rewrite-Fixture $json
         $parsed = $once | ConvertFrom-Json
-        Assert-True ($null -eq $parsed.input[0].content[0].PSObject.Properties['prompt_cache_breakpoint']) `
-            'Only the last text block receives the marker'
-        Assert-Equal $parsed.input[0].content[1].prompt_cache_breakpoint.mode 'explicit' 'Last text is marked'
+        Assert-Equal $parsed.cache_control.type 'ephemeral' 'Claude aliases receive automatic caching'
         Assert-Equal (Rewrite-Fixture $once) $once 'A second rewrite is byte-for-byte stable'
     }
 
-    Invoke-TestCase 'Only markable messages in the continuous leading prefix are selected' {
-        $json = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":[{"type":"input_image","image_url":"x"}]},{"role":"developer","content":"text"},{"role":"developer","content":[]},{"role":"user","content":"hi"}]}'
-        $parsed = Rewrite-Fixture $json | ConvertFrom-Json
-        Assert-Equal $parsed.input[0].content[0].image_url 'x' 'Image-only system message survives'
-        Assert-Equal $parsed.input[1].content[0].prompt_cache_breakpoint.mode 'explicit' 'The available text prefix is marked'
-        Assert-Equal $parsed.input[2].content.Count 0 'Empty content is preserved'
-    }
-
-    Invoke-TestCase 'User, function, and item reference boundaries stop prefix marking' {
-        foreach ($boundary in @(
-            '{"role":"user","content":"hi"}',
-            '{"type":"function_call","call_id":"call-1","name":"tool","arguments":"{}"}',
-            '{"type":"function_call_output","call_id":"call-1","output":"ok"}',
-            '{"type":"item_reference","id":"offline-item"}',
-            '{"role":"assistant","content":"previous response"}'
-        )) {
-            $json = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},' +
-                $boundary + ',{"role":"developer","content":"dynamic tail"}]}'
-            $parsed = Rewrite-Fixture $json | ConvertFrom-Json
-            Assert-Equal $parsed.input[0].content[0].prompt_cache_breakpoint.mode 'explicit' 'Leading system remains marked'
-            Assert-Equal $parsed.input[2].content 'dynamic tail' 'No marker is added beyond a boundary'
-            Assert-Equal (Convert-FixtureJson $parsed.input[1]) (Convert-FixtureJson ($boundary | ConvertFrom-Json)) `
-                'Boundary item is unchanged'
-        }
-    }
-
-    Invoke-TestCase 'Instructions-only and user-first requests retain automatic caching without rearrangement' {
+    Invoke-TestCase 'Automatic caching preserves input variants without choosing content breakpoints' {
         foreach ($json in @(
             '{"model":"anthropic/claude-opus-5","instructions":"system instruction","input":"hello"}',
             '{"model":"anthropic/claude-opus-5","instructions":"system instruction","input":[{"role":"user","content":"hello"},{"role":"developer","content":"later"}]}',
-            '{"model":"anthropic/claude-opus-5","instructions":"system instruction","input":[]}'
+            '{"model":"anthropic/claude-opus-5","instructions":"system instruction","input":[]}',
+            '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":[{"type":"input_image","image_url":"x"}]},{"role":"developer","content":[]}]}',
+            '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},{"type":"function_call","call_id":"one","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"one","output":"ok"},{"type":"item_reference","id":"offline-item"},{"role":"assistant","content":"previous response"},{"role":"developer","content":"dynamic tail"}]}'
         )) {
-            $original = $json | ConvertFrom-Json
             $parsed = Rewrite-Fixture $json | ConvertFrom-Json
-            Assert-Equal $parsed.instructions $original.instructions 'Instructions remain unchanged'
-            Assert-Equal (Convert-FixtureJson $parsed.input) (Convert-FixtureJson $original.input) 'Input remains unchanged'
             Assert-Equal $parsed.cache_control.type 'ephemeral' 'Automatic cache hint remains available'
+            $parsed.PSObject.Properties.Remove('cache_control')
+            Assert-Equal (Convert-FixtureJson $parsed) $json 'Original request structure remains unchanged'
         }
     }
 
@@ -189,7 +149,7 @@ try {
             '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},{"type":"function_call_output","call_id":"one","output":[{"type":"input_text","text":"result","cache_control":{"type":"ephemeral"}}]}]}'
         )) {
             $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            $rewritten = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestBody($bytes)
+            $rewritten = [CodexOpenRouter.OpenRouterCacheProxyV6]::RewriteRequestBody($bytes)
             Assert-Equal ([Convert]::ToBase64String($rewritten)) ([Convert]::ToBase64String($bytes)) `
                 'Caller-supplied cache settings prevent automatic policy changes'
         }
@@ -202,7 +162,7 @@ try {
             $original = $json | ConvertFrom-Json
             $parsed = Rewrite-Fixture $json | ConvertFrom-Json
             Assert-Equal $parsed.cache_control.type 'ephemeral' 'Tool parameter names cannot suppress cache injection'
-            Assert-Equal $parsed.input[0].content[0].prompt_cache_breakpoint.mode 'explicit' 'System prefix is still explicitly marked'
+            Assert-Equal $parsed.input[0].content 'base' 'System content retains its string representation'
             Assert-Equal (Convert-FixtureJson $parsed.tools) (Convert-FixtureJson $original.tools) 'Business tool schema is unchanged'
         }
         $json = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},{"type":"function_call_output","call_id":"one","output":"{\"cache_control\":\"business-data\"}"}]}'
@@ -493,7 +453,7 @@ try {
                 function script:Test-CxProxyProcess { param($State) return $true }
                 function script:Get-CxProxyState { param($StatePath) return $null }
                 $absent = try { Get-CxClaudeCacheStatus; 'NO_ERROR' } catch { $_.Exception.Message }
-                function script:Get-CxProxyState { param($StatePath) return [pscustomobject]@{ Schema = 4 } }
+                function script:Get-CxProxyState { param($StatePath) return [pscustomobject]@{ Schema = 5 } }
                 $legacy = try { Get-CxClaudeCacheStatus; 'NO_ERROR' } catch { $_.Exception.Message }
                 [pscustomobject]@{ Absent = $absent; Legacy = $legacy }
             }

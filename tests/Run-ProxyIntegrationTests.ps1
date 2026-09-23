@@ -489,9 +489,9 @@ namespace CodexOpenRouter.IntegrationTests
     $script:ProxyBaseUrl = "http://127.0.0.1:$port"
 
     $flags = [Reflection.BindingFlags]'Instance,NonPublic'
-    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV5]
+    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV6]
     $serverType = $proxyType.GetNestedType('ProxyServer', [Reflection.BindingFlags]::NonPublic)
-    if ($null -eq $serverType) { throw 'The V5 private ProxyServer test seam is unavailable.' }
+    if ($null -eq $serverType) { throw 'The V6 private ProxyServer test seam is unavailable.' }
     $server = [Activator]::CreateInstance(
         $serverType,
         $flags,
@@ -524,13 +524,13 @@ namespace CodexOpenRouter.IntegrationTests
     $downstreamClient.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     $script:DownstreamClient = $downstreamClient
 
-    Invoke-TestCase 'Initial health uses the V5 schema without an upstream request' {
+    Invoke-TestCase 'Initial health uses the V6 schema without an upstream request' {
         $result = Invoke-BufferedProxyRequest -Method GET -Path '/__cxor/health' -Body $null
         try {
             $health = $result.Text | ConvertFrom-Json
             Assert-Equal ([int]$result.Response.StatusCode) 200 'Initial health is reachable'
             Assert-Equal $health.status 'ok' 'Initial health status'
-            Assert-Equal $health.schema 5 'Initial health schema'
+            Assert-Equal $health.schema 6 'Initial health schema'
             Assert-Equal $health.pid $PID 'Health identifies the in-process test server'
             Assert-Equal $health.total_requests 0 'Health does not count as inference traffic'
             Assert-Equal $health.total_failures 0 'Initial failure counter'
@@ -743,7 +743,7 @@ namespace CodexOpenRouter.IntegrationTests
             $actual = @($health.PSObject.Properties.Name | Sort-Object)
             Assert-Equal ($actual -join ',') ($allowed -join ',') `
                 'Health fields exactly match the safe allowlist'
-            Assert-Equal $health.schema 5 'Diagnostics retain the V5 schema'
+            Assert-Equal $health.schema 6 'Diagnostics retain the V6 schema'
             Assert-Equal $health.total_requests 9 'Only authenticated Responses requests are counted'
             Assert-Equal $health.total_failures 8 'Each failed request is counted once'
             Assert-Equal $health.claude_cache.requests 0 'Other models never populate Claude counters'
@@ -793,7 +793,7 @@ namespace CodexOpenRouter.IntegrationTests
         }
     }
 
-    $claudeBody = '{"model":"anthropic/claude-opus-5","instructions":"OFFLINE_INSTRUCTIONS_SENTINEL","input":[{"role":"system","content":"OFFLINE_SYSTEM_SENTINEL"},{"role":"user","content":"OFFLINE_USER_SENTINEL"}],"stream":true}'
+    $claudeBody = '{"model":"anthropic/claude-opus-5","instructions":"OFFLINE_INSTRUCTIONS_SENTINEL","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}],"input":[{"role":"system","content":"OFFLINE_SYSTEM_SENTINEL"},{"role":"user","content":"OFFLINE_USER_SENTINEL"}],"stream":true}'
     $expectedClaudeRequests = 0
     foreach ($case in @(
         @{ Scenario = 'claude_hit'; Status = 'hit'; CountField = 'hit_requests'; Http = 200; Body = [CodexOpenRouter.IntegrationTests.FixturesV4]::ClaudeHitSse },
@@ -832,7 +832,7 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-Equal $health.claude_cache.($case.CountField) 1 'The corresponding cache result counter increments once'
             Assert-Equal $health.claude_cache.last.status $case.Status 'Last result accurately reports the cache outcome'
             Assert-Equal $health.claude_cache.last.http_status $case.Http 'Last cache result retains upstream HTTP status'
-            Assert-Equal $health.claude_cache.last.policy 'system_prefix' 'Last cache result identifies automatic prefix policy'
+            Assert-Equal $health.claude_cache.last.policy 'automatic' 'Last cache result identifies the automatic cache policy'
             Assert-Equal $health.claude_cache.last.system_cache_coverage 'unknown' 'Aggregate usage does not claim exact prefix coverage'
             Assert-True (-not [string]::IsNullOrWhiteSpace($health.claude_cache.last.observed_utc)) 'Cache evidence has a timestamp'
             $cacheFields = @('requests', 'hit_requests', 'write_requests', 'miss_requests', 'unknown_requests', 'rejected_requests', 'last') | Sort-Object
@@ -859,8 +859,11 @@ namespace CodexOpenRouter.IntegrationTests
             Assert-True ($observed.SessionId -cmatch '^cxor-claude-[0-9a-f]+$') 'Claude requests carry opaque stable routing'
             Assert-True (-not $observed.ContainsLocalToken) 'Opaque routing cannot expose the local secret'
             $requestJson = $observed.Body | ConvertFrom-Json
-            Assert-Equal $requestJson.input[0].content[0].prompt_cache_breakpoint.mode 'explicit' 'Actual forwarded request marks the stable system prefix'
-            Assert-Equal $requestJson.instructions 'OFFLINE_INSTRUCTIONS_SENTINEL' 'Forwarded instructions stay unchanged'
+            Assert-Equal ($requestJson.cache_control | ConvertTo-Json -Compress) '{"type":"ephemeral"}' `
+                'Actual forwarded request enables top-level automatic caching'
+            $requestJson.PSObject.Properties.Remove('cache_control')
+            Assert-Equal ($requestJson | ConvertTo-Json -Depth 100 -Compress) $claudeBody `
+                'Forwarded input, tools, instructions, and other original fields stay unchanged'
         }
     }
 
@@ -913,7 +916,7 @@ namespace CodexOpenRouter.IntegrationTests
                 $originals[$name] = (Get-Item -LiteralPath "Function:\$name").ScriptBlock
             }
             $script:OfflineCacheQueryState = [pscustomobject]@{
-                Schema = 5; Port = $TestPort; Token = $TestToken; ProcessId = $TestPid
+                Schema = 6; Port = $TestPort; Token = $TestToken; ProcessId = $TestPid
             }
             try {
                 function script:Assert-CxRuntime { }
