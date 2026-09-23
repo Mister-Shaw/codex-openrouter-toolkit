@@ -489,9 +489,9 @@ namespace CodexOpenRouter.IntegrationTests
     $script:ProxyBaseUrl = "http://127.0.0.1:$port"
 
     $flags = [Reflection.BindingFlags]'Instance,NonPublic'
-    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV4]
+    $proxyType = [CodexOpenRouter.OpenRouterCacheProxyV5]
     $serverType = $proxyType.GetNestedType('ProxyServer', [Reflection.BindingFlags]::NonPublic)
-    if ($null -eq $serverType) { throw 'The V4 private ProxyServer test seam is unavailable.' }
+    if ($null -eq $serverType) { throw 'The V5 private ProxyServer test seam is unavailable.' }
     $server = [Activator]::CreateInstance(
         $serverType,
         $flags,
@@ -524,13 +524,13 @@ namespace CodexOpenRouter.IntegrationTests
     $downstreamClient.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     $script:DownstreamClient = $downstreamClient
 
-    Invoke-TestCase 'Initial health uses the V4 schema without an upstream request' {
+    Invoke-TestCase 'Initial health uses the V5 schema without an upstream request' {
         $result = Invoke-BufferedProxyRequest -Method GET -Path '/__cxor/health' -Body $null
         try {
             $health = $result.Text | ConvertFrom-Json
             Assert-Equal ([int]$result.Response.StatusCode) 200 'Initial health is reachable'
             Assert-Equal $health.status 'ok' 'Initial health status'
-            Assert-Equal $health.schema 4 'Initial health schema'
+            Assert-Equal $health.schema 5 'Initial health schema'
             Assert-Equal $health.pid $PID 'Health identifies the in-process test server'
             Assert-Equal $health.total_requests 0 'Health does not count as inference traffic'
             Assert-Equal $health.total_failures 0 'Initial failure counter'
@@ -743,7 +743,7 @@ namespace CodexOpenRouter.IntegrationTests
             $actual = @($health.PSObject.Properties.Name | Sort-Object)
             Assert-Equal ($actual -join ',') ($allowed -join ',') `
                 'Health fields exactly match the safe allowlist'
-            Assert-Equal $health.schema 4 'Diagnostics retain the V4 schema'
+            Assert-Equal $health.schema 5 'Diagnostics retain the V5 schema'
             Assert-Equal $health.total_requests 9 'Only authenticated Responses requests are counted'
             Assert-Equal $health.total_failures 8 'Each failed request is counted once'
             Assert-Equal $health.claude_cache.requests 0 'Other models never populate Claude counters'
@@ -913,7 +913,7 @@ namespace CodexOpenRouter.IntegrationTests
                 $originals[$name] = (Get-Item -LiteralPath "Function:\$name").ScriptBlock
             }
             $script:OfflineCacheQueryState = [pscustomobject]@{
-                Schema = 4; Port = $TestPort; Token = $TestToken; ProcessId = $TestPid
+                Schema = 5; Port = $TestPort; Token = $TestToken; ProcessId = $TestPid
             }
             try {
                 function script:Assert-CxRuntime { }
