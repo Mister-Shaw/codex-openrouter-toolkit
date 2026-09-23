@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.13' `
+        -Expected '0.1.14' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `

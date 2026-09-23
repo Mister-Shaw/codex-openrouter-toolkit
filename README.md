@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.13`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.14`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -143,7 +143,7 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 
 - 找不到 `cx` / `cxor`：确认安装使用 PowerShell 7.4+，并检查用户模块目录是否位于 `$env:PSModulePath`。
 - 目录同步失败：根据警告中的脱敏原因检查 Key、网络和 OpenRouter 服务状态。最后有效目录会保留；存在有效旧目录时会重新校验后复用并显示警告。无有效回退来源时，本次切换会在关闭桌面端前中止。
-- 持续显示旧目录告警：安装当前源码版本 `0.1.13`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
+- 持续显示旧目录告警：安装当前源码版本 `0.1.14`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
 - 遇到 `Content` 为空、CLI JSON 损坏或系统临时目录 PATH alias 警告：安装当前源码版本；目录同步固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。

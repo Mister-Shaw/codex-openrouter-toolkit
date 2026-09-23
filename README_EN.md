@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.13`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.14`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -143,7 +143,7 @@ The uninstaller stops the local proxy and removes its state, the user module, to
 
 - `cx` or `cxor` cannot be found: install with PowerShell 7.4 or later and confirm that the user module directory is present in `$env:PSModulePath`.
 - Catalog synchronization fails: use the sanitized warning details to check the key, network connection, and OpenRouter service status. The last valid catalog is preserved, revalidated, and reused with a warning when available. If no valid fallback is available, the switch stops before the running desktop process is closed.
-- Repeated stale-catalog warnings: install the current source version, `0.1.13`. Older versions require `~openai/gpt-latest` and reject valid new catalogs that have removed that entry. The new version supports `~openai/gpt-sol-latest` and selects the default model dynamically. `cxor` now shows all models by default.
+- Repeated stale-catalog warnings: install the current source version, `0.1.14`. Older versions require `~openai/gpt-latest` and reject valid new catalogs that have removed that entry. The new version supports `~openai/gpt-sol-latest` and selects the default model dynamically. `cxor` now shows all models by default.
 - Empty `Content` errors, damaged CLI JSON, or system-temp PATH alias warnings: install the current source version. Catalog synchronization uses UTF-8 decoding for Codex CLI stdout and stderr, prioritizes the direct OpenRouter catalog request, and uses an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.

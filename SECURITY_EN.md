@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes target the current source version, `0.1.13`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
+Security fixes target the current source version, `0.1.14`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 
