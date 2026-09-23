@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.13`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.14`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -113,14 +113,14 @@ OpenRouter 模式下，Codex 发往 OpenRouter Responses API 的所有请求都�
 cxor -CacheStatus
 ```
 
-此命令需要已有运行中的 V4 代理，不能与 `-SetKey` / `-AllModels` 组合；它只读取当前本地代理的认证健康信息，不连接上游推理、不刷新模型目录，也不启动或重启代理及桌面端。状态报告包括：
+此命令需要已有运行中的 V5 代理，不能与 `-SetKey` / `-AllModels` 组合；它只读取当前本地代理的认证健康信息，不连接上游推理、不刷新模型目录，也不启动或重启代理及桌面端。状态报告包括：
 
 - 代理本次运行期间的 Claude 请求总数，以及命中、仅写入、未命中、未知和上游拒绝计数。请求分类互斥：在输入用量有效时，缓存读取大于 0 计为命中；读取为 0 且写入大于 0 计为仅写入；读取与写入均明确为 0 计为未命中。用量不足以判断时计为未知。一次命中请求的读取和写入 token 仍可同时大于 0。
 - 最近一条 Claude 请求上游返回的 `InputTokens`、`CachedTokens`、`CacheWriteTokens`、`OutputTokens` 和 `CostUSD`；没有返回或无法解析的字段保持 `null`，不会用 0 代替。`CacheReadPercent` 是缓存读取 token 占本轮全部输入 token 的百分比。
 - `CompletionStatus` 单独报告响应完成情况，如 `completed`、`incomplete`、`failed`、`transport_error` 或 `unknown`；HTTP 400 及以上的上游拒绝计为 `rejected`。
 - `SystemCacheCoverage`（健康响应中的 `system_cache_coverage`）固定为 `unknown`：聚合用量能够确认本轮是否有缓存读取，但无法证明整个系统提示都在命中范围内。
 
-V4 代理在转发响应时进行有大小限制的旁路用量解析，仍按原字节流转发响应。内存只保留累计计数与最近一次用量，不保存逐条历史；代理重启后统计清零，已有历史账单不会自动补入。解析不到用量时应按未知处理，实际收费以 OpenRouter 账单为准。
+V5 代理在转发响应时进行有大小限制的旁路用量解析，仍按原字节流转发响应。内存只保留累计计数与最近一次用量，不保存逐条历史；代理重启后统计清零，已有历史账单不会自动补入。解析不到用量时应按未知处理，实际收费以 OpenRouter 账单为准。
 
 代理状态保存在 `<CODEX_HOME>\openrouter-cache-proxy.json`，默认位置为 `%USERPROFILE%\.codex\openrouter-cache-proxy.json`。状态文件记录进程、环回端口、随机本地访问令牌、启动时间和模块路径，不保存 OpenRouter API Key、提示或响应。电脑重启或代理退出后，OpenRouter provider 的 command-auth 会先校验并按原端口与令牌自愈代理，再读取当前用户的 API Key。`cx` 默认保留代理与状态，`cx -StopProxy` 和卸载器会停止代理并删除状态文件。
 
@@ -143,11 +143,11 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 
 - 找不到 `cx` / `cxor`：确认安装使用 PowerShell 7.4+，并检查用户模块目录是否位于 `$env:PSModulePath`。
 - 目录同步失败：根据警告中的脱敏原因检查 Key、网络和 OpenRouter 服务状态。最后有效目录会保留；存在有效旧目录时会重新校验后复用并显示警告。无有效回退来源时，本次切换会在关闭桌面端前中止。
-- 持续显示旧目录告警：安装当前源码版本 `0.1.13`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
+- 持续显示旧目录告警：安装当前源码版本 `0.1.14`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
 - 遇到 `Content` 为空、CLI JSON 损坏或系统临时目录 PATH alias 警告：安装当前源码版本；目录同步固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。
-- 出现 `502 Bad Gateway`：安装当前源码版本后，再运行一次 `cxor`。V4 代理保留 0.1.10 的错误响应修复，并优先按旧地址轮换代理；认证健康检查同时提供脱敏的最近失败来源、固定阶段和 HTTP 状态。
+- 出现 `502 Bad Gateway`：安装当前源码版本后，再运行一次 `cxor`。V5 代理保留 0.1.10 的错误响应修复，并优先按旧地址轮换代理；认证健康检查同时提供脱敏的最近失败来源、固定阶段和 HTTP 状态。
 - `cached_tokens` 持续为 0：先运行 `cxor -CacheStatus`，区分缓存写入、确认未命中和用量未知。确认连续请求具有相同的长前缀、使用相同模型和稳定的路由标识，并满足模型的最小可缓存长度和有效期要求。缓存读取量大于 0 也无法单独证明整个系统提示命中。
 - Claude 返回 `402` 或积分不足：这表示上游额度检查拒绝了请求；余额、在途请求占用与上游额度检查都会影响是否获准调用。该状态无法证明缓存失败，也不能保证缓存折扣会让请求获准。先检查 OpenRouter 余额与在途请求，避免反复重试大上下文。
 

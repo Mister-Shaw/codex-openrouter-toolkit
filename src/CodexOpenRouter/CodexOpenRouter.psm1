@@ -7,17 +7,17 @@ $script:ManagedBlockBegin = '# BEGIN CodexOpenRouter managed provider'
 $script:ManagedBlockEnd = '# END CodexOpenRouter managed provider'
 $script:ProxyHeaderName = 'x-cxor-proxy-token'
 $script:EmptyInstructions = ''
-$script:FeaturedModels = @(
-    [pscustomobject]@{ Slug = '~openai/gpt-latest'; DisplayName = 'GPT Latest' }
-    [pscustomobject]@{ Slug = '~openai/gpt-sol-latest'; DisplayName = 'GPT Sol Latest' }
-    [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol-pro'; DisplayName = 'GPT-5.6 Sol Pro' }
-    [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol'; DisplayName = 'GPT-5.6 Sol' }
-    [pscustomobject]@{ Slug = 'openai/gpt-5.6-terra'; DisplayName = 'GPT-5.6 Terra' }
-    [pscustomobject]@{ Slug = 'openai/gpt-5.3-codex'; DisplayName = 'GPT-5.3 Codex' }
-    [pscustomobject]@{ Slug = '~anthropic/claude-opus-latest'; DisplayName = 'Claude Opus Latest' }
-    [pscustomobject]@{ Slug = 'anthropic/claude-opus-5'; DisplayName = 'Claude Opus 5' }
-    [pscustomobject]@{ Slug = '~anthropic/claude-sonnet-latest'; DisplayName = 'Claude Sonnet Latest' }
-    [pscustomobject]@{ Slug = 'anthropic/claude-sonnet-5'; DisplayName = 'Claude Sonnet 5' }
+$script:DefaultModelOrder = @(
+    '~openai/gpt-latest'
+    '~openai/gpt-sol-latest'
+    'openai/gpt-5.6-sol-pro'
+    'openai/gpt-5.6-sol'
+    'openai/gpt-5.6-terra'
+    'openai/gpt-5.3-codex'
+    '~anthropic/claude-opus-latest'
+    'anthropic/claude-opus-5'
+    '~anthropic/claude-sonnet-latest'
+    'anthropic/claude-sonnet-5'
 )
 
 function Assert-CxRuntime {
@@ -106,13 +106,22 @@ function New-CxTomlCodeMask {
     $characters = $Content.ToCharArray()
     $mask = $Content.ToCharArray()
     $state = 'normal'
+    $inValue = $false
+    $arrayDepth = 0
     $index = 0
     while ($index -lt $characters.Length) {
         $character = $characters[$index]
         $isNewLine = $character -eq "`r" -or $character -eq "`n"
         switch ($state) {
             'normal' {
-                if ($character -eq '#') {
+                if ($isNewLine) {
+                    if ($arrayDepth -gt 0) { $mask[$index] = ' ' }
+                    else { $inValue = $false }
+                }
+                elseif ($character -eq '=') { $inValue = $true }
+                elseif ($inValue -and $character -eq '[') { $arrayDepth++ }
+                elseif ($inValue -and $character -eq ']' -and $arrayDepth -gt 0) { $arrayDepth-- }
+                elseif ($character -eq '#') {
                     $mask[$index] = ' '
                     $state = 'comment'
                 }
@@ -144,7 +153,11 @@ function New-CxTomlCodeMask {
                 }
             }
             'comment' {
-                if ($isNewLine) { $state = 'normal' }
+                if ($isNewLine) {
+                    if ($arrayDepth -gt 0) { $mask[$index] = ' ' }
+                    else { $inValue = $false }
+                    $state = 'normal'
+                }
                 else { $mask[$index] = ' ' }
             }
             'basic' {
@@ -167,14 +180,11 @@ function New-CxTomlCodeMask {
                 if ($character -eq "'") { $state = 'normal' }
             }
             'multi-basic' {
-                if (-not $isNewLine) { $mask[$index] = ' ' }
+                $mask[$index] = ' '
                 if ($character -eq '\') {
                     if ($index + 1 -lt $characters.Length) {
                         $index++
-                        if ($characters[$index] -ne "`r" -and
-                            $characters[$index] -ne "`n") {
-                            $mask[$index] = ' '
-                        }
+                        $mask[$index] = ' '
                     }
                 }
                 elseif ($character -eq '"') {
@@ -194,7 +204,7 @@ function New-CxTomlCodeMask {
                 }
             }
             'multi-literal' {
-                if (-not $isNewLine) { $mask[$index] = ' ' }
+                $mask[$index] = ' '
                 if ($character -eq "'") {
                     $quoteRun = 1
                     while ($index + $quoteRun -lt $characters.Length -and
@@ -217,6 +227,7 @@ function New-CxTomlCodeMask {
     if ($state -in @('basic', 'literal', 'multi-basic', 'multi-literal')) {
         throw 'TOML 中存在未闭合的字符串。'
     }
+    if ($arrayDepth -ne 0) { throw 'TOML 中存在未闭合的数组。' }
     return -join $mask
 }
 
@@ -331,7 +342,8 @@ function Update-CxConfigContent {
     }
 
     $mask = New-CxTomlCodeMask $Content
-    $matches = [regex]::Matches($Content, '.*?(?:\r\n|\n|\r|$)', 'Singleline') |
+    # Masked newlines keep multiline strings and arrays with their assignment key.
+    $matches = [regex]::Matches($mask, '.*?(?:\r\n|\n|\r|$)', 'Singleline') |
         Where-Object { $_.Length -gt 0 }
     $kept = [Collections.Generic.List[string]]::new()
     $inRoot = $true
@@ -341,8 +353,8 @@ function Update-CxConfigContent {
     $openRouterKey = '(?:openrouter|"openrouter"|''openrouter'')'
 
     foreach ($match in $matches) {
-        $line = $match.Value
-        $code = $mask.Substring($match.Index, $match.Length)
+        $line = $Content.Substring($match.Index, $match.Length)
+        $code = $match.Value
         $trimmed = $line.Trim()
         if ($trimmed -ceq $script:ManagedBlockBegin -or
             $trimmed -ceq $script:ManagedBlockEnd) {
@@ -540,7 +552,7 @@ function Commit-CxConfigChange {
 }
 
 function Initialize-CxProxyType {
-    if ('CodexOpenRouter.OpenRouterCacheProxyV4' -as [type]) { return }
+    if ('CodexOpenRouter.OpenRouterCacheProxyV5' -as [type]) { return }
 
     $source = @'
 using System;
@@ -557,7 +569,7 @@ using System.Threading.Tasks;
 
 namespace CodexOpenRouter
 {
-    public static class OpenRouterCacheProxyV4
+    public static class OpenRouterCacheProxyV5
     {
         private const int MaximumRequestBytes = 64 * 1024 * 1024;
         private const int MaximumErrorResponseBytes = 1024 * 1024;
@@ -648,7 +660,7 @@ namespace CodexOpenRouter
                 "cache_control",
                 new JsonObject { ["type"] = "ephemeral" });
             return new UTF8Encoding(false).GetBytes(
-                request.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+                request.ToJsonString(new JsonSerializerOptions { WriteIndented = false, MaxDepth = 128 }));
         }
 
         private static bool HasCachePolicy(JsonObject request)
@@ -748,7 +760,8 @@ namespace CodexOpenRouter
 
         public static string GetClaudeRoutingKey(string json, string secret)
         {
-            JsonObject request = JsonNode.Parse(json) as JsonObject;
+            JsonObject request = JsonNode.Parse(json, null,
+                new JsonDocumentOptions { MaxDepth = 128 }) as JsonObject;
             return GetClaudeRoutingKey(request, secret);
         }
 
@@ -785,7 +798,7 @@ namespace CodexOpenRouter
             using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret)))
             {
                 byte[] digest = hmac.ComputeHash(Encoding.UTF8.GetBytes(
-                    CanonicalJson(identity).ToJsonString()));
+                    CanonicalJson(identity).ToJsonString(new JsonSerializerOptions { MaxDepth = 128 })));
                 return "cxor-claude-" + Convert.ToHexString(digest).ToLowerInvariant();
             }
         }
@@ -835,6 +848,7 @@ namespace CodexOpenRouter
             private readonly MemoryStream data = new MemoryStream();
             private bool lineOverflow;
             private bool dataOverflow;
+            private bool skipLineFeed;
             private bool terminalSeen;
             private string eventName = string.Empty;
             private string completionStatus = "unknown";
@@ -858,8 +872,14 @@ namespace CodexOpenRouter
                     }
                     for (int i = offset; i < offset + count; i++)
                     {
-                        if (bytes[i] == 10)
+                        if (skipLineFeed)
                         {
+                            skipLineFeed = false;
+                            if (bytes[i] == 10) continue;
+                        }
+                        if (bytes[i] == 10 || bytes[i] == 13)
+                        {
+                            skipLineFeed = bytes[i] == 13;
                             ProcessLine();
                             if (terminalSeen) break;
                         }
@@ -917,7 +937,6 @@ namespace CodexOpenRouter
                 {
                     byte[] bytes = line.ToArray();
                     int length = bytes.Length;
-                    if (length > 0 && bytes[length - 1] == 13) length--;
                     if (length == 0) ProcessEvent();
                     else if (length >= 5 && bytes[0] == 'd' && bytes[1] == 'a' &&
                         bytes[2] == 't' && bytes[3] == 'a' && bytes[4] == ':')
@@ -1012,6 +1031,7 @@ namespace CodexOpenRouter
                 data.SetLength(0);
                 lineOverflow = false;
                 dataOverflow = false;
+                skipLineFeed = false;
                 eventName = string.Empty;
             }
 
@@ -1508,7 +1528,7 @@ namespace CodexOpenRouter
                 var health = new JsonObject
                 {
                     ["status"] = "ok",
-                    ["schema"] = 4,
+                    ["schema"] = 5,
                     ["pid"] = Environment.ProcessId,
                     ["total_requests"] = Interlocked.Read(ref totalRequests),
                     ["total_failures"] = Interlocked.Read(ref totalFailures)
@@ -1844,7 +1864,7 @@ function Start-CxProxyServer {
         throw '缓存代理缺少有效的启动令牌。'
     }
     Initialize-CxProxyType
-    [CodexOpenRouter.OpenRouterCacheProxyV4]::RunAsync($Port, $token).
+    [CodexOpenRouter.OpenRouterCacheProxyV5]::RunAsync($Port, $token).
         GetAwaiter().GetResult()
 }
 
@@ -1884,7 +1904,7 @@ function Get-CxProxyState {
     }
     catch { return $null }
     $started = [DateTimeOffset]::MinValue
-    if ($schema -notin @(1, 2, 3, 4) -or
+    if ($schema -notin @(1, 2, 3, 4, 5) -or
         $processId -le 0 -or
         $port -lt 1024 -or $port -gt 65535 -or
         [string]$data.token -notmatch '\A[A-F0-9]{64}\z' -or
@@ -1938,7 +1958,7 @@ function Test-CxProxyHealthContent {
     try { $health = $Content | ConvertFrom-Json -ErrorAction Stop }
     catch { return $false }
     return [string]$health.status -ceq 'ok' -and
-        [int]$health.schema -eq 4 -and
+        [int]$health.schema -eq 5 -and
         [int]$health.pid -eq $ExpectedProcessId
 }
 
@@ -1998,8 +2018,8 @@ function Get-CxClaudeCacheStatus {
     if ($null -eq $state -or -not (Test-CxProxyProcess $state)) {
         throw '没有运行中的缓存代理。请先运行 cxor；此查询不会启动代理或调用模型。'
     }
-    if ($state.Schema -ne 4) {
-        throw '当前代理尚未支持 Claude 缓存检测。安装新版后运行一次 cxor 以加载新版代理。'
+    if ($state.Schema -ne 5) {
+        throw '当前代理版本较旧。请运行一次 cxor 以加载新版代理。'
     }
     $handler = [Net.Http.HttpClientHandler]::new()
     $handler.UseProxy = $false
@@ -2126,7 +2146,7 @@ $module = Import-Module -Name $env:CXOR_PROXY_MODULE_PATH -Force -PassThru
         }
 
         $stateContent = [ordered]@{
-            schema = 4
+            schema = 5
             pid = $process.Id
             port = $Port
             token = $Token
@@ -2340,14 +2360,17 @@ function Invoke-CxProcess {
     $process = [Diagnostics.Process]::new()
     try {
         $process.StartInfo = $startInfo
+        $elapsed = [Diagnostics.Stopwatch]::StartNew()
         if (-not $process.Start()) { throw 'Codex CLI 未能启动。' }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            try { $process.Kill($true) } catch { }
-            [void]$process.WaitForExit(5000)
-            throw 'Codex CLI 刷新模型目录超时。'
+        if (-not $process.WaitForExit([Math]::Max(0, $TimeoutMilliseconds - $elapsed.ElapsedMilliseconds))) {
+            throw [TimeoutException]::new()
         }
+        [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)).
+            WaitAsync([TimeSpan]::FromMilliseconds(
+                [Math]::Max(0, $TimeoutMilliseconds - $elapsed.ElapsedMilliseconds)
+            )).GetAwaiter().GetResult()
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         if ([Text.Encoding]::UTF8.GetByteCount($stdout) -gt $script:MaximumCatalogBytes -or
@@ -2355,6 +2378,11 @@ function Invoke-CxProcess {
             throw 'Codex CLI 输出超过大小限制。'
         }
         [pscustomobject]@{ ExitCode = $process.ExitCode; StandardOutput = $stdout; StandardError = $stderr }
+    }
+    catch [TimeoutException] {
+        try { $process.Kill($true) } catch { }
+        [void]$process.WaitForExit(5000)
+        throw 'Codex CLI 刷新模型目录超时。'
     }
     finally { $process.Dispose() }
 }
@@ -2464,8 +2492,7 @@ function Set-CxObjectProperty {
 
 function Convert-CxCatalogPrompt {
     param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
-        [switch]$AllModels
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
     )
 
     if ([string]::IsNullOrWhiteSpace($Content)) {
@@ -2504,50 +2531,7 @@ function Convert-CxCatalogPrompt {
         }
         else { $messages = $messagesProperty.Value }
         Set-CxObjectProperty -Object $messages -Name 'instructions_template' -Value $script:EmptyInstructions
-    }
-
-    if ($AllModels) {
-        foreach ($model in $models) {
-            Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'list'
-        }
-    }
-    else {
-        $featuredBySlug = @{}
-        for ($index = 0; $index -lt $script:FeaturedModels.Count; $index++) {
-            $definition = $script:FeaturedModels[$index]
-            $featuredBySlug[[string]$definition.Slug] = [pscustomobject]@{
-                DisplayName = [string]$definition.DisplayName
-                Priority = $index + 1
-            }
-        }
-
-        $featured = [Collections.Generic.List[object]]::new()
-        $hidden = [Collections.Generic.List[object]]::new()
-        foreach ($model in $models) {
-            $slug = [string]$model.slug
-            if ($featuredBySlug.ContainsKey($slug)) {
-                $definition = $featuredBySlug[$slug]
-                Set-CxObjectProperty -Object $model -Name 'display_name' -Value $definition.DisplayName
-                Set-CxObjectProperty -Object $model -Name 'priority' -Value $definition.Priority
-                Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'list'
-                $featured.Add($model)
-            }
-            else {
-                Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'hide'
-                $hidden.Add($model)
-            }
-        }
-
-        $orderedModels = @(
-            foreach ($definition in $script:FeaturedModels) {
-                foreach ($model in $featured) {
-                    if ([string]$model.slug -ieq [string]$definition.Slug) { $model }
-                }
-            }
-            foreach ($model in $hidden) { $model }
-        )
-        $modelsProperty.Value = $orderedModels
-        $models = $orderedModels
+        Set-CxObjectProperty -Object $model -Name 'visibility' -Value 'list'
     }
 
     $json = $catalog | ConvertTo-Json -Depth 100 -Compress
@@ -2583,7 +2567,6 @@ function Convert-CxCatalogPrompt {
 function Resolve-CxCatalogCandidate {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
-        [switch]$AllModels,
         [AllowNull()][string]$ApiKey,
         [AllowEmptyString()][string]$StandardError = ''
     )
@@ -2628,23 +2611,22 @@ function Resolve-CxCatalogCandidate {
             continue
         }
         try {
-            $converted = Convert-CxCatalogPrompt -Content $candidateContent `
-                -AllModels:$AllModels
+            $converted = Convert-CxCatalogPrompt -Content $candidateContent
             $convertedModels = @(($converted | ConvertFrom-Json -ErrorAction Stop).models)
             $defaultModel = $null
-            foreach ($definition in $script:FeaturedModels) {
+            foreach ($definition in $script:DefaultModelOrder) {
                 $defaultModel = $convertedModels | Where-Object {
-                    $_.slug -ieq $definition.Slug
+                    $_.slug -ieq $definition
                 } | Select-Object -First 1
                 if ($null -ne $defaultModel) { break }
             }
-            if ($null -eq $defaultModel -and $AllModels) {
+            if ($null -eq $defaultModel) {
                 $defaultModel = $convertedModels | Where-Object {
                     $_.slug -notlike '*:batch'
                 } | Select-Object -First 1
             }
             if ($null -eq $defaultModel) {
-                throw '目录缺少可用的默认模型；精选入口均不可用时可尝试 cxor -AllModels。'
+                throw '目录缺少可用的非 batch 默认模型。'
             }
             $previousProperty = $candidate.PSObject.Properties['IsPrevious']
             return [pscustomobject]@{
@@ -2684,8 +2666,7 @@ function Sync-CxOpenRouterCatalog {
         [Parameter(Mandatory)][string]$CliPath,
         [Parameter(Mandatory)][string]$ApiKey,
         [Parameter(Mandatory)][string]$CatalogPath,
-        [Parameter(Mandatory)][string]$AuthCommand,
-        [switch]$AllModels
+        [Parameter(Mandatory)][string]$AuthCommand
     )
 
     $temporaryHome = ''
@@ -2711,7 +2692,7 @@ function Sync-CxOpenRouterCatalog {
         if (-not [string]::IsNullOrWhiteSpace($directContent)) {
             try {
                 $resolvedCatalog = Resolve-CxCatalogCandidate `
-                    -Candidates @($directCandidate) -AllModels:$AllModels -ApiKey $ApiKey
+                    -Candidates @($directCandidate) -ApiKey $ApiKey
             }
             catch { $directFailure = Protect-CxText $_.Exception.Message $ApiKey }
         }
@@ -2740,17 +2721,31 @@ function Sync-CxOpenRouterCatalog {
             Write-CxTextFileAtomic -Path (Join-Path $temporaryHome 'config.toml') `
                 -Content $temporaryConfig
 
-            $result = Invoke-CxProcess -FilePath $CliPath `
-                -ArgumentList @('debug', 'models') -Environment @{
-                    CODEX_HOME = $temporaryHome
-                    OPENROUTER_API_KEY = $ApiKey
+            $cliFailure = ''
+            try {
+                $result = Invoke-CxProcess -FilePath $CliPath `
+                    -ArgumentList @('debug', 'models') -Environment @{
+                        CODEX_HOME = $temporaryHome
+                        OPENROUTER_API_KEY = $ApiKey
+                    }
+            }
+            catch {
+                $cliFailure = Protect-CxText $_.Exception.Message $ApiKey
+                $result = [pscustomobject]@{
+                    ExitCode = $null
+                    StandardOutput = ''
+                    StandardError = ''
                 }
+            }
             $standardOutput = [string]$result.StandardOutput
             $standardError = [string]$result.StandardError
             if ($standardOutput.Contains($ApiKey) -or $standardError.Contains($ApiKey)) {
                 throw 'Codex CLI 输出包含 API Key。'
             }
-            $cliDiagnostic = if ($result.ExitCode -eq 0) {
+            $cliDiagnostic = if ($cliFailure) {
+                $cliFailure
+            }
+            elseif ($result.ExitCode -eq 0) {
                 $standardError
             }
             else {
@@ -2760,7 +2755,10 @@ function Sync-CxOpenRouterCatalog {
             $candidates.Add([pscustomobject]@{
                     Label = 'Codex CLI stdout'
                     Content = $standardOutput
-                    Failure = if ($result.ExitCode -eq 0) {
+                    Failure = if ($cliFailure) {
+                        $cliFailure
+                    }
+                    elseif ($result.ExitCode -eq 0) {
                         ''
                     }
                     else { "Codex CLI 返回退出码 $($result.ExitCode)" }
@@ -2781,23 +2779,28 @@ function Sync-CxOpenRouterCatalog {
                 $cachePath = [IO.Path]::GetFullPath($cacheFile.FullName)
                 if ($seenCachePaths.Add($cachePath)) { $cachePaths.Add($cachePath) }
             }
+            $previousCatalogPath = [IO.Path]::GetFullPath($CatalogPath)
+            $cachePaths.Add($previousCatalogPath)
             foreach ($cachePath in $cachePaths) {
+                $cacheContent = ''
+                $cacheFailure = ''
+                try {
+                    $cacheContent = Read-CxTextFile -Path $cachePath `
+                        -MaximumBytes $script:MaximumCatalogBytes
+                }
+                catch { $cacheFailure = Protect-CxText $_.Exception.Message $ApiKey }
+                $isPrevious = $cachePath -eq $previousCatalogPath
                 $candidates.Add([pscustomobject]@{
-                        Label = "临时缓存 $([IO.Path]::GetFileName($cachePath))"
-                        Content = Read-CxTextFile -Path $cachePath `
-                            -MaximumBytes $script:MaximumCatalogBytes
-                        IsPrevious = $false
+                        Label = if ($isPrevious) { '上次有效 OpenRouter 目录' }
+                            else { "临时缓存 $([IO.Path]::GetFileName($cachePath))" }
+                        Content = $cacheContent
+                        Failure = $cacheFailure
+                        IsPrevious = $isPrevious
                     })
             }
-            $candidates.Add([pscustomobject]@{
-                    Label = '上次有效 OpenRouter 目录'
-                    Content = Read-CxTextFile -Path $CatalogPath `
-                        -MaximumBytes $script:MaximumCatalogBytes
-                    IsPrevious = $true
-                })
 
             $resolvedCatalog = Resolve-CxCatalogCandidate -Candidates @($candidates) `
-                -AllModels:$AllModels -ApiKey $ApiKey -StandardError $cliDiagnostic
+                -ApiKey $ApiKey -StandardError $cliDiagnostic
         }
         $catalog = [string]$resolvedCatalog.Content
         $writtenModels = @($resolvedCatalog.Models)
@@ -2938,7 +2941,6 @@ function Invoke-CxMode {
     param(
         [Parameter(Mandatory)][ValidateSet('Default', 'OpenRouter')][string]$Mode,
         [switch]$SetKey,
-        [switch]$AllModels,
         [switch]$StopProxy
     )
 
@@ -2958,8 +2960,7 @@ function Invoke-CxMode {
                 $authCommand = Get-CxAuthPowerShell
                 $cli = Get-CxCodexCliPath
                 $catalogResult = Sync-CxOpenRouterCatalog -CliPath $cli -ApiKey $key `
-                    -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
-                    -AllModels:$AllModels
+                    -CatalogPath $paths.CatalogPath -AuthCommand $authCommand
                 if ($catalogResult.UsedPreviousCatalog) {
                     Write-Warning ("OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。原因：" +
                         $catalogResult.FallbackDiagnostic)
@@ -3051,7 +3052,7 @@ function cxor {
         if ($SetKey -or $AllModels) { throw '-CacheStatus 不能与 -SetKey 或 -AllModels 同时使用。' }
         return Get-CxClaudeCacheStatus
     }
-    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey -AllModels
+    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey
 }
 
 Export-ModuleMember -Function @('cx', 'cxor')

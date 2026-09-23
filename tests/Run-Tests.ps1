@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.13' `
+        -Expected '0.1.14' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -173,7 +173,7 @@ try {
         }
         $passThrough = foreach ($entry in $passThroughInputs.GetEnumerator()) {
             $bytes = [Text.Encoding]::UTF8.GetBytes([string]$entry.Value)
-            $rewrittenBytes = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestBody(
+            $rewrittenBytes = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestBody(
                 $bytes
             )
             [pscustomobject]@{
@@ -185,51 +185,51 @@ try {
         }
         [pscustomobject]@{
             ClaudeInput = $claudeInput
-            Claude = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
+            Claude = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson(
                 $claudeInput
             )
-            Tilde = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
+            Tilde = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson(
                 $tildeInput
             )
             ExistingInput = $existingInput
-            Existing = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
+            Existing = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson(
                 $existingInput
             )
             NullInput = $nullInput
-            Null = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson(
+            Null = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson(
                 $nullInput
             )
-            LocalError = [CodexOpenRouter.OpenRouterCacheProxyV4]::CreateErrorJson(
+            LocalError = [CodexOpenRouter.OpenRouterCacheProxyV5]::CreateErrorJson(
                 'Local OpenRouter proxy failed at send_upstream.',
                 'cxor_proxy_error',
                 'send_upstream'
             )
-            EscapedError = [CodexOpenRouter.OpenRouterCacheProxyV4]::CreateErrorJson(
+            EscapedError = [CodexOpenRouter.OpenRouterCacheProxyV5]::CreateErrorJson(
                 "quote `" slash \ newline`n",
                 'cxor_proxy_error',
                 'escaped_error'
             )
-            EmptyUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            EmptyUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 '',
                 502
             )
-            StringUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            StringUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 '{"error":"rate limited"}',
                 429
             )
-            StructuredUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            StructuredUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 '{"error":{"message":"unauthorized","type":"authentication_error","code":401}}',
                 401
             )
-            HtmlUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            HtmlUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 '<html>sk-or-sensitive-diagnostic-value</html>',
                 502
             )
-            UnknownUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            UnknownUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 '{"error":{"message":"Unknown error"}}',
                 502
             )
-            OversizedUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV4]::NormalizeUpstreamErrorJson(
+            OversizedUpstreamError = [CodexOpenRouter.OpenRouterCacheProxyV5]::NormalizeUpstreamErrorJson(
                 ('{"error":{"message":"' + ('x' * 2049) + '"}}'),
                 502
             )
@@ -315,7 +315,7 @@ try {
         -Action {
             & $module {
                 Initialize-CxProxyType
-                [void][CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson('{')
+                [void][CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson('{')
             }
         } `
         -Pattern '*' `
@@ -393,7 +393,7 @@ try {
         [void](New-Item -ItemType Directory -Path $temporaryRoot -ErrorAction Stop)
         $statePath = Join-Path $temporaryRoot 'state.json'
         try {
-            $records = foreach ($schema in @(1, 2, 3, 4, 0, 5)) {
+            $records = foreach ($schema in @(1, 2, 3, 4, 5, 0, 6)) {
                 $content = [ordered]@{
                     schema = $schema
                     pid = 32123
@@ -412,8 +412,11 @@ try {
             }
             [pscustomobject]@{
                 Records = @($records)
+                HealthV5 = Test-CxProxyHealthContent `
+                    -Content '{"status":"ok","schema":5,"pid":32123,"total_requests":4,"total_failures":1,"last_error_source":"upstream","last_error_code":"upstream_http_502","last_error_phase":"upstream_response","last_upstream_status":502,"last_request_bytes":299833,"last_error_utc":"2026-08-28T09:22:06Z"}' `
+                    -ExpectedProcessId 32123
                 HealthV4 = Test-CxProxyHealthContent `
-                    -Content '{"status":"ok","schema":4,"pid":32123,"total_requests":4,"total_failures":1,"last_error_source":"upstream","last_error_code":"upstream_http_502","last_error_phase":"upstream_response","last_upstream_status":502,"last_request_bytes":299833,"last_error_utc":"2026-08-28T09:22:06Z"}' `
+                    -Content '{"status":"ok","schema":4,"pid":32123}' `
                     -ExpectedProcessId 32123
                 HealthV3 = Test-CxProxyHealthContent `
                     -Content '{"status":"ok","schema":3,"pid":32123}' `
@@ -422,13 +425,13 @@ try {
                     -Content '{"status":"ok","schema":2,"pid":32123}' `
                     -ExpectedProcessId 32123
                 WrongPid = Test-CxProxyHealthContent `
-                    -Content '{"status":"ok","schema":4,"pid":32124}' `
+                    -Content '{"status":"ok","schema":5,"pid":32124}' `
                     -ExpectedProcessId 32123
-                ExpandedV4 = Test-CxProxyHealthContent `
-                    -Content ('{"status":"ok","schema":4,"pid":32123,"padding":"' + ('x' * 2048) + '"}') `
+                ExpandedV5 = Test-CxProxyHealthContent `
+                    -Content ('{"status":"ok","schema":5,"pid":32123,"padding":"' + ('x' * 2048) + '"}') `
                     -ExpectedProcessId 32123
                 Oversized = Test-CxProxyHealthContent `
-                    -Content ('{"status":"ok","schema":4,"pid":32123,"padding":"' + ('x' * 8192) + '"}') `
+                    -Content ('{"status":"ok","schema":5,"pid":32123,"padding":"' + ('x' * 8192) + '"}') `
                     -ExpectedProcessId 32123
                 Malformed = Test-CxProxyHealthContent `
                     -Content '{' `
@@ -461,6 +464,9 @@ try {
     $stateV4 = $proxyStateValidation.Records |
         Where-Object InputSchema -EQ 4 |
         Select-Object -First 1
+    $stateV5 = $proxyStateValidation.Records |
+        Where-Object InputSchema -EQ 5 |
+        Select-Object -First 1
     Assert-True `
         -Condition ([bool]$stateV1.Accepted) `
         -Message 'V1 proxy state remains readable for safe upgrades'
@@ -489,7 +495,14 @@ try {
         -Actual ([int]$stateV4.ParsedSchema) `
         -Expected 4 `
         -Message 'V4 proxy state preserves its implementation schema'
-    foreach ($invalidSchema in @(0, 5)) {
+    Assert-True `
+        -Condition ([bool]$stateV5.Accepted) `
+        -Message 'V5 proxy state is accepted'
+    Assert-Equal `
+        -Actual ([int]$stateV5.ParsedSchema) `
+        -Expected 5 `
+        -Message 'V5 proxy state preserves its implementation schema'
+    foreach ($invalidSchema in @(0, 6)) {
         $invalidState = $proxyStateValidation.Records |
             Where-Object InputSchema -EQ $invalidSchema |
             Select-Object -First 1
@@ -498,8 +511,11 @@ try {
             -Message "Proxy state rejects schema $invalidSchema"
     }
     Assert-True `
-        -Condition ([bool]$proxyStateValidation.HealthV4) `
-        -Message 'V4 proxy health with sanitized diagnostics is accepted'
+        -Condition ([bool]$proxyStateValidation.HealthV5) `
+        -Message 'V5 proxy health with sanitized diagnostics is accepted'
+    Assert-True `
+        -Condition (-not [bool]$proxyStateValidation.HealthV4) `
+        -Message 'V4 proxy health triggers an implementation upgrade'
     Assert-True `
         -Condition (-not [bool]$proxyStateValidation.HealthV3) `
         -Message 'V3 proxy health triggers an implementation upgrade'
@@ -510,8 +526,8 @@ try {
         -Condition (-not [bool]$proxyStateValidation.WrongPid) `
         -Message 'Proxy health rejects a mismatched process id'
     Assert-True `
-        -Condition ([bool]$proxyStateValidation.ExpandedV4) `
-        -Message 'V4 health accepts expanded cache accounting beyond the old 1KB limit'
+        -Condition ([bool]$proxyStateValidation.ExpandedV5) `
+        -Message 'V5 health accepts expanded cache accounting beyond the old 1KB limit'
     Assert-True `
         -Condition (-not [bool]$proxyStateValidation.Oversized) `
         -Message 'Proxy health keeps an 8KB response bound'
@@ -550,7 +566,7 @@ try {
             function script:Get-CxProxyState {
                 param([string]$StatePath)
                 [pscustomobject]@{
-                    Schema = 3
+                    Schema = 4
                     ProcessId = 65432
                     Port = 43127
                     Token = 'B' * 64
@@ -560,7 +576,12 @@ try {
                 }
             }
             function script:Test-CxProxyProcess { param($State) return $true }
-            function script:Test-CxProxyHealth { param($State) return $false }
+            function script:Test-CxProxyHealth {
+                param($State)
+                Test-CxProxyHealthContent `
+                    -Content ('{"status":"ok","schema":4,"pid":' + $State.ProcessId + '}') `
+                    -ExpectedProcessId $State.ProcessId
+            }
             function script:Get-Process {
                 [CmdletBinding()]
                 param([int]$Id)
@@ -589,7 +610,7 @@ try {
                 $script:UpgradeStartPort = $Port
                 $script:UpgradeStartToken = $Token
                 return [pscustomobject]@{
-                    Schema = 4
+                    Schema = 5
                     ProcessId = 65433
                     Port = $Port
                     Token = $Token
@@ -630,28 +651,28 @@ try {
     }
     Assert-Equal `
         -Actual $proxyUpgrade.ResultSchema `
-        -Expected 4 `
-        -Message 'V3 proxy is replaced with the V4 implementation'
+        -Expected 5 `
+        -Message 'V4 proxy is replaced with the V5 implementation'
     Assert-Equal `
         -Actual $proxyUpgrade.StopCalls `
         -Expected 1 `
-        -Message 'V3 proxy process is stopped exactly once'
+        -Message 'V4 proxy process is stopped exactly once'
     Assert-Equal `
         -Actual $proxyUpgrade.RemoveCalls `
         -Expected 1 `
-        -Message 'V3 proxy state is removed before replacement'
+        -Message 'V4 proxy state is removed before replacement'
     Assert-Equal `
         -Actual $proxyUpgrade.FreePortCalls `
         -Expected 0 `
-        -Message 'V3 proxy upgrade first reuses the existing loopback port'
+        -Message 'V4 proxy upgrade first reuses the existing loopback port'
     Assert-Equal `
         -Actual $proxyUpgrade.StartPort `
         -Expected 43127 `
-        -Message 'V3 proxy upgrade preserves the existing loopback port'
+        -Message 'V4 proxy upgrade preserves the existing loopback port'
     Assert-Equal `
         -Actual $proxyUpgrade.StartToken `
         -Expected ('B' * 64) `
-        -Message 'V3 proxy upgrade preserves the existing local token'
+        -Message 'V4 proxy upgrade preserves the existing local token'
 
     $requestKey = 'sk-' + 'or-' + ('q' * 24)
     $requestResult = & $module {
@@ -723,6 +744,65 @@ try {
             param($Original)
             Set-Item -LiteralPath Function:\Invoke-CxProcess -Value $Original
         } $originalVersionInvoke
+    }
+
+    $processResult = & $module {
+        Invoke-CxProcess -FilePath (Join-Path $PSHOME 'pwsh.exe') `
+            -ArgumentList @('-NoProfile', '-Command', '[Console]::Out.Write("stdout"); [Console]::Error.Write("stderr")') `
+            -Environment @{} -TimeoutMilliseconds 3000
+    }
+    Assert-Equal -Actual $processResult.StandardOutput -Expected 'stdout' `
+        -Message 'CLI process captures normal stdout'
+    Assert-Equal -Actual $processResult.StandardError -Expected 'stderr' `
+        -Message 'CLI process captures normal stderr'
+
+    $pipeChildState = Join-Path ([IO.Path]::GetTempPath()) ('cx-pipe-test-' + [guid]::NewGuid().ToString('N') + '.json')
+    $pipeScript = @'
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+foreach ($argument in @('-NoProfile', '-Command', 'Start-Sleep -Seconds 8')) { [void]$startInfo.ArgumentList.Add($argument) }
+$child = [Diagnostics.Process]::Start($startInfo)
+try {
+    [IO.File]::WriteAllText($env:CX_TEST_PROCESS_STATE, (@{
+        pid = $child.Id
+        started_ticks = $child.StartTime.ToUniversalTime().Ticks
+    } | ConvertTo-Json -Compress))
+} finally { $child.Dispose() }
+[Console]::Out.Write('parent complete')
+'@
+    try {
+        $pipeEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($pipeScript))
+        $pipeElapsed = [Diagnostics.Stopwatch]::StartNew()
+        Assert-ThrowsLike -Action {
+            & $module {
+                param($Encoded, $StatePath)
+                Invoke-CxProcess -FilePath (Join-Path $PSHOME 'pwsh.exe') `
+                    -ArgumentList @('-NoProfile', '-EncodedCommand', $Encoded) `
+                    -Environment @{ CX_TEST_PROCESS_STATE = $StatePath } -TimeoutMilliseconds 3000
+            } $pipeEncoded $pipeChildState | Out-Null
+        } -Pattern '*Codex CLI 刷新模型目录超时*' -Message 'A descendant holding output pipes cannot defeat the CLI deadline'
+        Assert-True -Condition ($pipeElapsed.ElapsedMilliseconds -lt 7000) `
+            -Message 'Process exit and both output reads share one timeout budget'
+    }
+    finally {
+        if (Test-Path -LiteralPath $pipeChildState -PathType Leaf) {
+            $pipeState = [IO.File]::ReadAllText($pipeChildState) | ConvertFrom-Json
+            $pipeChild = Get-Process -Id $pipeState.pid -ErrorAction SilentlyContinue
+            if ($null -ne $pipeChild) {
+                try {
+                    if ($pipeChild.Path -eq (Join-Path $PSHOME 'pwsh.exe') -and
+                        $pipeChild.StartTime.ToUniversalTime().Ticks -eq $pipeState.started_ticks) {
+                        $pipeChild.Kill($true)
+                        [void]$pipeChild.WaitForExit(5000)
+                    }
+                }
+                finally { $pipeChild.Dispose() }
+            }
+            Remove-Item -LiteralPath $pipeChildState -Force
+        }
     }
 
     $tomlStringResult = & $module {
@@ -937,6 +1017,68 @@ keep_tooling = "yes"
         )) `
         -Message 'Default TOML removes the OpenRouter provider'
 
+    $multilineManagedValues = @'
+model = """\
+openai/old"""
+model_provider = '''
+openrouter'''
+model_reasoning_effort = """\
+high"""
+model_catalog_json = '''
+C:\old-catalog.json'''
+model_providers.openrouter.auth.args = [
+    "-Command", # Ignore brackets in comments: ] [
+    ["a ] bracket", "[ another bracket"],
+    """\
+old-auth-command""",
+]
+'@
+    $multilinePreservedValues = @'
+developer_instructions = """
+# BEGIN CodexOpenRouter managed provider
+model = "keep this text"
+[model_providers.openrouter]
+# END CodexOpenRouter managed provider
+"""
+custom_literal = '''
+# BEGIN CodexOpenRouter managed provider
+model_provider = "keep this too"
+# END CodexOpenRouter managed provider
+'''
+keep = true
+custom_array = [
+    "[model_providers.openrouter]", # A comment with ] [
+    ["nested", "array"],
+    """
+# BEGIN CodexOpenRouter managed provider
+# END CodexOpenRouter managed provider
+""",
+]
+[[array.table]]
+model = "keep this table value"
+[model_providers.other]
+name = "keep this provider"
+'@
+    foreach ($lineEnding in @("`n", "`r`n")) {
+        $multilineInput = ($multilineManagedValues + "`n" +
+            $multilinePreservedValues) -replace '\r?\n', $lineEnding
+        $multilineExpected = ($multilinePreservedValues -replace '\r?\n', $lineEnding) + "`r`n"
+        $multilineOutput = & $module {
+            param($Content)
+            Update-CxConfigContent -Content $Content -Mode Default
+        } $multilineInput
+        Assert-Equal -Actual $multilineOutput -Expected $multilineExpected `
+            -Message "TOML removes complete managed multiline strings and arrays, preserving unrelated content and tables (newline length $($lineEnding.Length))"
+    }
+    foreach ($invalidToml in @('model = """unfinished', 'model_providers.openrouter.auth.args = [')) {
+        $rejected = & $module {
+            param($Content)
+            try { [void](Update-CxConfigContent -Content $Content -Mode Default); return $false }
+            catch { return $true }
+        } $invalidToml
+        Assert-True -Condition $rejected -Message 'TOML rejects an unfinished managed value before rewriting'
+    }
+
     $catalogObject = [ordered]@{
         source = 'keep-root'
         metadata = [ordered]@{ revision = 7; keep = $true }
@@ -965,10 +1107,10 @@ keep_tooling = "yes"
     $catalogResult = & $module {
         param($Content)
 
-        $converted = Convert-CxCatalogPrompt -Content $Content -AllModels
+        $converted = Convert-CxCatalogPrompt -Content $Content
         [pscustomobject]@{
             Converted = $converted
-            ConvertedAgain = Convert-CxCatalogPrompt -Content $converted -AllModels
+            ConvertedAgain = Convert-CxCatalogPrompt -Content $converted
             Instructions = $script:EmptyInstructions
         }
     } $catalogInput
@@ -1061,40 +1203,18 @@ keep_tooling = "yes"
     $selectionResult = & $module {
         param($Content)
 
-        $curated = Convert-CxCatalogPrompt -Content $Content
-        [pscustomobject]@{
-            Curated = $curated
-            CuratedAgain = Convert-CxCatalogPrompt -Content $curated
-            AllModels = Convert-CxCatalogPrompt -Content $Content -AllModels
-        }
+        Convert-CxCatalogPrompt -Content $Content
     } $selectionCatalog
-    $curatedCatalog = $selectionResult.Curated | ConvertFrom-Json
-    $curatedModels = @($curatedCatalog.models)
-    $curatedVisible = @($curatedModels | Where-Object { $_.visibility -ceq 'list' })
-    Assert-Equal `
-        -Actual ($curatedVisible.slug -join ',') `
-        -Expected '~openai/gpt-latest,OPENAI/GPT-5.6-SOL,openai/gpt-5.3-codex,~anthropic/claude-opus-latest,anthropic/claude-sonnet-5' `
-        -Message 'Curated catalog lists only featured models in configured order'
-    Assert-Equal `
-        -Actual ([string]$curatedVisible[1].display_name) `
-        -Expected 'GPT-5.6 Sol' `
-        -Message 'Curated catalog normalizes featured display names case-insensitively'
-    Assert-Equal `
-        -Actual ([int]$curatedVisible[1].priority) `
-        -Expected 4 `
-        -Message 'Curated catalog assigns stable featured priority'
-    $curatedHidden = @($curatedModels | Where-Object { $_.visibility -ceq 'hide' })
-    Assert-Equal `
-        -Actual ($curatedHidden.slug -join ',') `
-        -Expected 'vendor/other-model' `
-        -Message 'Curated catalog hides non-featured models'
-    Assert-Equal `
-        -Actual $selectionResult.CuratedAgain `
-        -Expected $selectionResult.Curated `
-        -Message 'Curated catalog conversion is idempotent'
-
-    $allCatalog = $selectionResult.AllModels | ConvertFrom-Json
+    $allCatalog = $selectionResult | ConvertFrom-Json
     $allModels = @($allCatalog.models)
+    Assert-Equal `
+        -Actual ($allModels.slug -join ',') `
+        -Expected (@(($selectionCatalog | ConvertFrom-Json).models).slug -join ',') `
+        -Message 'Catalog preserves upstream model order'
+    Assert-Equal `
+        -Actual @($allModels | Where-Object visibility -ceq 'list').Count `
+        -Expected 6 `
+        -Message 'Every validated model is visible without a private mode switch'
     Assert-Equal `
         -Actual ([string]$allModels[0].visibility) `
         -Expected 'list' `
@@ -1172,63 +1292,47 @@ keep_tooling = "yes"
     $newAliasCatalog = $selectionCatalog.Replace(
         '~openai/gpt-latest', '~openai/gpt-sol-latest'
     )
-    foreach ($allModelsMode in @($false, $true)) {
-        $newAliasResult = & $module {
-            param($Content, $AllModels)
-            Resolve-CxCatalogCandidate -Candidates @(
-                [pscustomobject]@{ Label = 'new aliases'; Content = $Content }
-            ) -AllModels:$AllModels
-        } $newAliasCatalog $allModelsMode
-        Assert-Equal `
-            -Actual ([string]$newAliasResult.DefaultModel) `
-            -Expected '~openai/gpt-sol-latest' `
-            -Message "New alias is selected without the retired alias, AllModels=$allModelsMode"
-        Assert-Equal `
-            -Actual @($newAliasResult.Models | Where-Object {
-                $_.slug -ceq $newAliasResult.DefaultModel -and $_.visibility -ceq 'list'
-            }).Count `
-            -Expected 1 `
-            -Message 'Selected default exists and is visible in the published catalog'
-    }
+    $newAliasResult = & $module {
+        param($Content)
+        Resolve-CxCatalogCandidate -Candidates @(
+            [pscustomobject]@{ Label = 'new aliases'; Content = $Content }
+        )
+    } $newAliasCatalog
+    Assert-Equal `
+        -Actual ([string]$newAliasResult.DefaultModel) `
+        -Expected '~openai/gpt-sol-latest' `
+        -Message 'New alias is selected without the retired alias'
+    Assert-Equal `
+        -Actual @($newAliasResult.Models | Where-Object {
+            $_.slug -ceq $newAliasResult.DefaultModel -and $_.visibility -ceq 'list'
+        }).Count `
+        -Expected 1 `
+        -Message 'Selected default exists and is visible in the published catalog'
 
     $unfeaturedCatalog = '{"models":[{"slug":"vendor/model:batch"},{"slug":"vendor/interactive"}]}'
-    Assert-ThrowsLike `
-        -Action {
-            & $module {
-                param($Content)
-                Resolve-CxCatalogCandidate -Candidates @(
-                    [pscustomobject]@{ Label = 'unfeatured'; Content = $Content }
-                )
-            } $unfeaturedCatalog | Out-Null
-        }.GetNewClosure() `
-        -Pattern '*-AllModels*' `
-        -Message 'Curated mode rejects catalogs with no featured model and explains the alternative'
     $unfeaturedAllResult = & $module {
         param($Content)
         Resolve-CxCatalogCandidate -Candidates @(
             [pscustomobject]@{ Label = 'unfeatured'; Content = $Content }
-        ) -AllModels
+        )
     } $unfeaturedCatalog
     Assert-Equal `
         -Actual ([string]$unfeaturedAllResult.DefaultModel) `
         -Expected 'vendor/interactive' `
         -Message 'All-model mode skips batch-only entries when no featured model remains'
-    foreach ($allModelsMode in @($false, $true)) {
-        Assert-ThrowsLike `
-            -Action {
-                & $module {
-                    param($AllModels)
-                    Resolve-CxCatalogCandidate -Candidates @(
-                        [pscustomobject]@{
-                            Label = 'batch only'
-                            Content = '{"models":[{"slug":"vendor/model:batch"}]}'
-                        }
-                    ) -AllModels:$AllModels
-                } $allModelsMode | Out-Null
-            }.GetNewClosure() `
-            -Pattern '*未返回可用模型目录*' `
-            -Message "Batch-only catalogs are rejected, AllModels=$allModelsMode"
-    }
+    Assert-ThrowsLike `
+        -Action {
+            & $module {
+                Resolve-CxCatalogCandidate -Candidates @(
+                    [pscustomobject]@{
+                        Label = 'batch only'
+                        Content = '{"models":[{"slug":"vendor/model:batch"}]}'
+                    }
+                ) | Out-Null
+            }
+        }.GetNewClosure() `
+        -Pattern '*未返回可用模型目录*' `
+        -Message 'Batch-only catalogs are rejected'
 
     $resolverFailure = $null
     try {
@@ -1290,6 +1394,20 @@ keep_tooling = "yes"
                         -Path (Join-Path $Environment.CODEX_HOME $script:SyncTestCacheName) `
                         -Content $script:SyncTestCacheContent
                 }
+                if ($script:SyncTestBadCache -eq 'utf8') {
+                    [IO.File]::WriteAllBytes(
+                        (Join-Path $Environment.CODEX_HOME 'models_cache.openrouter.json'),
+                        [byte[]]@(0xFF)
+                    )
+                }
+                elseif ($script:SyncTestBadCache -eq 'oversized') {
+                    $cacheStream = [IO.File]::Create(
+                        (Join-Path $Environment.CODEX_HOME 'models_cache.openrouter.json')
+                    )
+                    try { $cacheStream.SetLength($script:MaximumCatalogBytes + 1) }
+                    finally { $cacheStream.Dispose() }
+                }
+                if ($script:SyncTestProcessFailure) { throw $script:SyncTestProcessFailure }
                 return [pscustomobject]@{
                     ExitCode = $script:SyncTestExitCode
                     StandardOutput = $script:SyncTestStandardOutput
@@ -1321,6 +1439,8 @@ keep_tooling = "yes"
             $script:SyncTestExitCode = 0
             $script:SyncTestStandardOutput = ''
             $script:SyncTestStandardError = ''
+            $script:SyncTestProcessFailure = ''
+            $script:SyncTestBadCache = ''
             $script:SyncTestProcessCalls = 0
             $script:SyncTestVersionCalls = 0
             $script:SyncTestDirectCalls = 0
@@ -1405,8 +1525,8 @@ keep_tooling = "yes"
             -Message 'Synchronization reports the provider-specific cache source'
         Assert-Equal `
             -Actual ([int]$providerSync.VisibleModelCount) `
-            -Expected 5 `
-            -Message 'Provider-cache synchronization applies curated visibility'
+            -Expected 6 `
+            -Message 'Provider-cache synchronization makes every model visible'
         $temporaryConfig = & $module { $script:SyncTestTemporaryConfig }
         Assert-True `
             -Condition ($temporaryConfig -notmatch '(?m)^model\s*=') `
@@ -1457,8 +1577,7 @@ keep_tooling = "yes"
                 -CliPath 'C:\cx-test\codex.exe' `
                 -ApiKey $ApiKey `
                 -CatalogPath $CatalogPath `
-                -AuthCommand 'C:\cx-test\powershell.exe' `
-                -AllModels
+                -AuthCommand 'C:\cx-test\powershell.exe'
         } $previousCatalogPath $resolverKey
         Assert-True `
             -Condition ([bool]$previousAllSync.UsedPreviousCatalog) `
@@ -1556,6 +1675,70 @@ keep_tooling = "yes"
         Assert-True `
             -Condition (-not (Test-Path -LiteralPath $nonzeroMissingPath)) `
             -Message 'Failed nonzero synchronization does not publish a catalog'
+
+        foreach ($processFailure in @('CLI launch failed', 'CLI refresh timed out')) {
+            & $module {
+                param($Failure)
+                $script:SyncTestProcessFailure = $Failure
+            } $processFailure
+            $beforeFallback = [Convert]::ToBase64String([IO.File]::ReadAllBytes($previousCatalogPath))
+            $exceptionFallback = & $module {
+                param($CatalogPath, $ApiKey)
+                Sync-CxOpenRouterCatalog -CliPath 'C:\cx-test\codex.exe' -ApiKey $ApiKey `
+                    -CatalogPath $CatalogPath -AuthCommand 'C:\cx-test\powershell.exe'
+            } $previousCatalogPath $resolverKey
+            Assert-True -Condition ([bool]$exceptionFallback.UsedPreviousCatalog) `
+                -Message "$processFailure still allows the previous catalog"
+            Assert-True -Condition ($exceptionFallback.FallbackDiagnostic.Contains($processFailure)) `
+                -Message 'CLI exceptions remain in fallback diagnostics'
+            Assert-Equal -Actual ([Convert]::ToBase64String([IO.File]::ReadAllBytes($previousCatalogPath))) `
+                -Expected $beforeFallback -Message 'Fallback preserves an already normalized catalog byte for byte'
+        }
+
+        foreach ($cacheCase in @(
+                @{ BadCache = 'utf8'; Source = 'Codex CLI stdout' },
+                @{ BadCache = 'oversized'; Source = '临时缓存 models_cache.json' },
+                @{ BadCache = 'utf8'; Source = '上次有效 OpenRouter 目录' }
+            )) {
+            & $module {
+                param($Case, $Content)
+                $script:SyncTestProcessFailure = ''
+                $script:SyncTestExitCode = 0
+                $script:SyncTestStandardError = ''
+                $script:SyncTestBadCache = $Case.BadCache
+                $script:SyncTestCacheName = 'models_cache.json'
+                $script:SyncTestStandardOutput = if ($Case.Source -eq 'Codex CLI stdout') { $Content } else { '' }
+                $script:SyncTestCacheContent = if ($Case.Source -eq '临时缓存 models_cache.json') { $Content } else { '' }
+            } $cacheCase $selectionCatalog
+            $badCacheFallback = & $module {
+                param($CatalogPath, $ApiKey)
+                Sync-CxOpenRouterCatalog -CliPath 'C:\cx-test\codex.exe' -ApiKey $ApiKey `
+                    -CatalogPath $CatalogPath -AuthCommand 'C:\cx-test\powershell.exe'
+            } $previousCatalogPath $resolverKey
+            Assert-Equal -Actual $badCacheFallback.CatalogSource -Expected $cacheCase.Source `
+                -Message 'An unreadable cache does not block another valid catalog source'
+        }
+
+        foreach ($leakChannel in @('stdout', 'stderr')) {
+            & $module {
+                param($Channel, $ApiKey)
+                $script:SyncTestBadCache = ''
+                $script:SyncTestStandardOutput = if ($Channel -eq 'stdout') { $ApiKey } else { '' }
+                $script:SyncTestStandardError = if ($Channel -eq 'stderr') { $ApiKey } else { '' }
+            } $leakChannel $resolverKey
+            $beforeLeak = [Convert]::ToBase64String([IO.File]::ReadAllBytes($previousCatalogPath))
+            Assert-ThrowsLike -Action {
+                & $module {
+                    param($CatalogPath, $ApiKey)
+                    Sync-CxOpenRouterCatalog -CliPath 'C:\cx-test\codex.exe' -ApiKey $ApiKey `
+                        -CatalogPath $CatalogPath -AuthCommand 'C:\cx-test\powershell.exe'
+                } $previousCatalogPath $resolverKey | Out-Null
+            } -Pattern '*Codex CLI 输出包含 API Key*' -Message 'CLI key leaks remain a hard failure'
+            Assert-Equal -Actual ([Convert]::ToBase64String([IO.File]::ReadAllBytes($previousCatalogPath))) `
+                -Expected $beforeLeak -Message 'A key leak never rewrites the existing catalog'
+        }
+        Assert-Equal -Actual @(Get-ChildItem -LiteralPath $syncTestRoot -Directory -Filter '.cxor-*').Count `
+            -Expected 0 -Message 'CLI exceptions and cache failures clean up every temporary home'
     }
     finally {
         & $module {
@@ -1653,7 +1836,6 @@ keep_tooling = "yes"
         $script:TestProxyCreated = $false
         $script:TestConfigModels = [Collections.Generic.List[string]]::new()
         $script:TestConfigModes = [Collections.Generic.List[string]]::new()
-        $script:TestAllModels = [Collections.Generic.List[bool]]::new()
 
         function script:Assert-CxRuntime { }
         function script:Get-CxPaths {
@@ -1700,19 +1882,17 @@ keep_tooling = "yes"
                 [string]$CliPath,
                 [string]$ApiKey,
                 [string]$CatalogPath,
-                [string]$AuthCommand,
-                [switch]$AllModels
+                [string]$AuthCommand
             )
 
             $script:TestSyncCalls++
-            $script:TestAllModels.Add([bool]$AllModels)
             if ($script:TestSyncShouldFail) {
                 throw 'synthetic catalog synchronization failure'
             }
             return [pscustomobject]@{
                 Path = $CatalogPath
                 ModelCount = 3
-                VisibleModelCount = if ($AllModels) { 3 } else { 2 }
+                VisibleModelCount = 3
                 DefaultModel = '~openai/gpt-sol-latest'
                 CatalogSource = 'test catalog'
                 UsedPreviousCatalog = $false
@@ -1770,7 +1950,6 @@ keep_tooling = "yes"
             Start = $script:TestStartCalls
             ProxyEnsure = $script:TestProxyEnsureCalls
             Models = @($script:TestConfigModels)
-            AllModels = @($script:TestAllModels)
         }
 
         $script:TestSyncShouldFail = $true
@@ -1786,7 +1965,6 @@ keep_tooling = "yes"
             ProxyStop = $script:TestProxyStopCalls
             Models = @($script:TestConfigModels)
             Modes = @($script:TestConfigModes)
-            AllModels = @($script:TestAllModels)
             Failure = $failure
         }
 
@@ -1842,10 +2020,6 @@ keep_tooling = "yes"
         -Expected '~openai/gpt-sol-latest,~openai/gpt-sol-latest' `
         -Message 'cxor writes the default model returned by each synchronization'
     Assert-Equal `
-        -Actual ($orchestration.AfterTwo.AllModels -join ',') `
-        -Expected 'True,True' `
-        -Message 'cxor defaults to all models and retains the explicit compatibility switch'
-    Assert-Equal `
         -Actual $orchestration.AfterFailure.Sync `
         -Expected 3 `
         -Message 'A third cxor call attempts synchronization'
@@ -1869,10 +2043,6 @@ keep_tooling = "yes"
         -Actual ($orchestration.AfterFailure.Models -join ',') `
         -Expected '~openai/gpt-sol-latest,~openai/gpt-sol-latest' `
         -Message 'Synchronization failure does not prepare a stale model config'
-    Assert-Equal `
-        -Actual ($orchestration.AfterFailure.AllModels -join ',') `
-        -Expected 'True,True,True' `
-        -Message 'Failed synchronization still records the requested catalog mode'
     Assert-True `
         -Condition ($orchestration.AfterFailure.Failure -like '*synchronization failure*') `
         -Message 'Synchronization failure is reported to the caller'

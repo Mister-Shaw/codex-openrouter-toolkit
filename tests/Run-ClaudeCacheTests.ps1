@@ -39,12 +39,12 @@ function Convert-FixtureJson {
 
 function Rewrite-Fixture {
     param([string]$Json)
-    return [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestJson($Json)
+    return [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestJson($Json)
 }
 
 function Get-FixtureKey {
     param([string]$Json, [string]$Secret = 'offline-secret-never-valid')
-    return [CodexOpenRouter.OpenRouterCacheProxyV4]::GetClaudeRoutingKey($Json, $Secret)
+    return [CodexOpenRouter.OpenRouterCacheProxyV5]::GetClaudeRoutingKey($Json, $Secret)
 }
 
 function Get-FixtureUsage {
@@ -54,7 +54,7 @@ function Get-FixtureUsage {
         [int]$ChunkSize = 7,
         [switch]$WithoutComplete
     )
-    $observer = [CodexOpenRouter.OpenRouterCacheProxyV4+CacheUsageObserver]::new($EventStream)
+    $observer = [CodexOpenRouter.OpenRouterCacheProxyV5+CacheUsageObserver]::new($EventStream)
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
     for ($offset = 0; $offset -lt $bytes.Length; $offset += $ChunkSize) {
         $count = [Math]::Min($ChunkSize, $bytes.Length - $offset)
@@ -189,7 +189,7 @@ try {
             '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},{"type":"function_call_output","call_id":"one","output":[{"type":"input_text","text":"result","cache_control":{"type":"ephemeral"}}]}]}'
         )) {
             $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            $rewritten = [CodexOpenRouter.OpenRouterCacheProxyV4]::RewriteRequestBody($bytes)
+            $rewritten = [CodexOpenRouter.OpenRouterCacheProxyV5]::RewriteRequestBody($bytes)
             Assert-Equal ([Convert]::ToBase64String($rewritten)) ([Convert]::ToBase64String($bytes)) `
                 'Caller-supplied cache settings prevent automatic policy changes'
         }
@@ -208,6 +208,26 @@ try {
         $json = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"},{"type":"function_call_output","call_id":"one","output":"{\"cache_control\":\"business-data\"}"}]}'
         $parsed = Rewrite-Fixture $json | ConvertFrom-Json
         Assert-Equal $parsed.cache_control.type 'ephemeral' 'Cache-like content inside tool-output text is ordinary data'
+    }
+
+    Invoke-TestCase 'Deep tool schemas keep the same request and routing depth limit' {
+        $schema = ('{"allOf":[' * 35) + '{"type":"string"}' + (']}' * 35)
+        $json = '{"model":"anthropic/claude-opus-5","input":[{"role":"system","content":"base"}],"tools":[{"type":"function","name":"lookup","parameters":' + $schema + '}]}'
+        $rewritten = Rewrite-Fixture $json
+        $parsed = $rewritten | ConvertFrom-Json
+        Assert-Equal $parsed.cache_control.type 'ephemeral' 'Schemas deeper than 64 still receive cache hints'
+        Assert-Equal (Convert-FixtureJson $parsed.tools[0].parameters) $schema 'Deep tool schemas remain unchanged'
+        $key = Get-FixtureKey $json
+        Assert-True ($key -cmatch '^cxor-claude-[0-9a-f]+$') 'Deep schemas support fallback routing'
+        Assert-Equal (Get-FixtureKey $rewritten) $key 'Rewriting deep schemas preserves routing identity'
+
+        $tooDeep = $json.Replace($schema, ('{"allOf":[' * 65) + '{"type":"string"}' + (']}' * 65))
+        foreach ($operation in @({ Rewrite-Fixture $tooDeep }, { Get-FixtureKey $tooDeep })) {
+            $rejected = $false
+            try { $null = & $operation }
+            catch { $rejected = $_.Exception.GetBaseException() -is [Text.Json.JsonException] }
+            Assert-True $rejected 'Requests exceeding depth 128 remain rejected as invalid JSON'
+        }
     }
 
     Invoke-TestCase 'All non-Claude model request bytes and routing remain unchanged' {
@@ -339,14 +359,16 @@ try {
         Assert-Equal $failed.usage_known $false 'Failed terminal usage cannot supply trusted accounting'
     }
 
-    Invoke-TestCase 'CRLF, multibyte UTF-8 splits, and multiline SSE data are accepted' {
-        $sse = ": heartbeat`r`nevent: response.completed`r`n" +
-            'data: {"type":"response.completed",' + "`r`n" +
-            'data: "response":{"id":"你好-é-🚀","usage":{"input_tokens":4096,"input_tokens_details":{"cached_tokens":4000,"cache_write_tokens":0},"output_tokens":4}}}' + "`r`n`r`n"
-        foreach ($chunkSize in @(1, 2, 3, 7, 4096)) {
-            $result = Get-FixtureUsage $sse -ChunkSize $chunkSize
-            Assert-Equal $result.status 'hit' 'Chunk boundaries preserve terminal JSON'
-            Assert-Equal $result.cached_tokens 4000 'UTF-8 content cannot corrupt adjacent accounting fields'
+    Invoke-TestCase 'LF, CRLF, CR, multibyte UTF-8 splits, and multiline SSE data are accepted' {
+        foreach ($newline in @("`n", "`r`n", "`r")) {
+            $sse = ": heartbeat${newline}event: response.completed${newline}" +
+                'data: {"type":"response.completed",' + $newline +
+                'data: "response":{"id":"你好-é-🚀","usage":{"input_tokens":4096,"input_tokens_details":{"cached_tokens":4000,"cache_write_tokens":0},"output_tokens":4}}}' + $newline + $newline
+            foreach ($chunkSize in @(1, 2, 3, 7, 4096)) {
+                $result = Get-FixtureUsage $sse -ChunkSize $chunkSize
+                Assert-Equal $result.status 'hit' 'Chunk boundaries preserve terminal JSON'
+                Assert-Equal $result.cached_tokens 4000 'UTF-8 content cannot corrupt adjacent accounting fields'
+            }
         }
     }
 
@@ -471,7 +493,7 @@ try {
                 function script:Test-CxProxyProcess { param($State) return $true }
                 function script:Get-CxProxyState { param($StatePath) return $null }
                 $absent = try { Get-CxClaudeCacheStatus; 'NO_ERROR' } catch { $_.Exception.Message }
-                function script:Get-CxProxyState { param($StatePath) return [pscustomobject]@{ Schema = 3 } }
+                function script:Get-CxProxyState { param($StatePath) return [pscustomobject]@{ Schema = 4 } }
                 $legacy = try { Get-CxClaudeCacheStatus; 'NO_ERROR' } catch { $_.Exception.Message }
                 [pscustomobject]@{ Absent = $absent; Legacy = $legacy }
             }
@@ -482,7 +504,7 @@ try {
             }
         }
         Assert-True ($guards.Absent -like '*没有运行中的缓存代理*') 'Absent state fails without starting a proxy'
-        Assert-True ($guards.Legacy -like '*尚未支持 Claude 缓存检测*') 'Legacy state requires explicit upgrade before querying'
+        Assert-True ($guards.Legacy -like '*当前代理版本较旧*') 'Legacy state requires explicit upgrade before querying'
     }
 }
 finally {
