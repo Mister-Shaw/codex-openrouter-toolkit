@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.11`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.13`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -13,12 +13,12 @@
 | --- | --- |
 | `cx` | 移除工具包托管的模型与 OpenRouter 配置，保留代理供已打开任务使用，并请求打开默认 Codex |
 | `cx -StopProxy` | 返回默认 Codex，同时立即停止本地代理；已打开的 OpenRouter 任务随后无法继续调用该端口 |
-| `cxor` | 同步 OpenRouter 最新 Codex 兼容目录，启动本地缓存感知代理，默认只显示 Claude 与 OpenAI 精选模型，切换到 OpenRouter，并请求重启桌面端 |
+| `cxor` | 同步 OpenRouter 最新 Codex 兼容目录，启动本地缓存感知代理，默认显示全部模型，切换到 OpenRouter，并请求重启桌面端 |
 | `cxor -SetKey` | 通过隐藏输入设置或轮换当前 Windows 用户的 OpenRouter API Key，然后进入 OpenRouter 模式 |
-| `cxor -AllModels` | 临时恢复完整 OpenRouter 模型列表；可与 `-SetKey` 组合 |
+| `cxor -AllModels` | 兼容旧写法，与 `cxor` 效果相同；无需再添加此参数 |
 | `cxor -CacheStatus` | 只读查询本地代理的 Claude 缓存用量和最近费用；不调用模型、不刷新目录、不重启桌面端 |
 
-除只读的 `-CacheStatus` 外，`cxor` 每次运行都会按当前 Codex CLI 三段版本号请求固定 HTTPS 地址 `https://openrouter.ai/api/v1/models`，请求包含 `client_version` 与 `originator: Codex Desktop`，禁用 HTTP 重定向，并且不使用 24 小时缓存。直连不可用或校验失败时依次检查 CLI stdout、provider 专用缓存、通用缓存、其他临时模型缓存和上次有效目录。候选目录只有通过结构、模型 ID、重复项、默认入口和提示字段校验后才会写入；复用旧目录时会显示警告，全部来源均不可用时会在修改 Codex 配置或关闭桌面端前中止切换。`-AllModels` 会把选中目录中的全部模型重新标记为可见。
+除只读的 `-CacheStatus` 外，`cxor` 每次运行都会按当前 Codex CLI 三段版本号请求固定 HTTPS 地址 `https://openrouter.ai/api/v1/models`，请求包含 `client_version` 与 `originator: Codex Desktop`，禁用 HTTP 重定向，并且不使用 24 小时缓存。直连不可用或校验失败时依次检查 CLI stdout、provider 专用缓存、通用缓存、其他临时模型缓存和上次有效目录。候选目录只有通过结构、模型 ID、重复项、默认模型和提示字段校验后才会写入；复用旧目录时会显示附脱敏、限长失败原因的警告，全部来源均不可用时会在修改 Codex 配置或关闭桌面端前中止切换。`cxor` 默认把选中目录中的全部模型标记为可见。
 
 ## 要求
 
@@ -51,19 +51,19 @@ cxor
 
 1. 获取 OpenRouter 最新模型目录，并生成 Codex Desktop 可读取的兼容目录。
 2. 将每个模型的 `base_instructions` 与 `model_messages.instructions_template` 写为空字符串。
-3. 默认显示 9 个 Claude / OpenAI 精选入口，并隐藏其余目录条目。
+3. 显示通过校验的目录中的全部模型。
 4. 在随机本地环回端口启动缓存感知代理，并完成健康检查。
 5. 更新 Codex 配置，并向 Windows 提交桌面端重启请求。
 6. 在新的 Codex 任务中，从桌面模型选择器选择目录内模型。
 
-目录必须包含官方入口 `~openai/gpt-latest`，它会作为初始模型；缺少该入口时，本次同步会在发布新目录前中止。精选模式保留完整目录对象，并用 `visibility = "hide"` 隐藏未精选项目，以兼容引用旧 slug 的历史任务。
+初始模型按下列优先顺序选择目录中实际存在的入口，优先使用 `~openai/gpt-latest`，其次是 `~openai/gpt-sol-latest`；这些入口均不存在时，使用目录中首个非 `:batch` 模型。全部模型保持可见。
 
-默认精选模型：
+默认入口优先顺序：
 
-- GPT Latest、GPT-5.6 Sol Pro、GPT-5.6 Sol、GPT-5.6 Terra、GPT-5.3 Codex
+- GPT Latest、GPT Sol Latest、GPT-5.6 Sol Pro、GPT-5.6 Sol、GPT-5.6 Terra、GPT-5.3 Codex
 - Claude Opus Latest、Claude Opus 5、Claude Sonnet Latest、Claude Sonnet 5
 
-需要完整列表时运行：
+以下旧写法继续兼容，与直接运行 `cxor` 效果相同：
 
 ```powershell
 cxor -AllModels
@@ -142,8 +142,9 @@ pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 ## 常见问题
 
 - 找不到 `cx` / `cxor`：确认安装使用 PowerShell 7.4+，并检查用户模块目录是否位于 `$env:PSModulePath`。
-- 目录同步失败：检查 Key、余额、网络和 OpenRouter 服务状态。最后有效目录会保留；存在有效旧目录时会重新校验后复用并显示警告。无有效回退来源时，本次切换会在关闭桌面端前中止。
-- 遇到 `Content` 为空、CLI JSON 损坏、系统临时目录 PATH alias 警告或持续显示旧目录告警：升级到 `0.1.8`；目录同步修复会固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
+- 目录同步失败：根据警告中的脱敏原因检查 Key、网络和 OpenRouter 服务状态。最后有效目录会保留；存在有效旧目录时会重新校验后复用并显示警告。无有效回退来源时，本次切换会在关闭桌面端前中止。
+- 持续显示旧目录告警：安装当前源码版本 `0.1.13`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
+- 遇到 `Content` 为空、CLI JSON 损坏或系统临时目录 PATH alias 警告：安装当前源码版本；目录同步固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。
 - 出现 `502 Bad Gateway`：安装当前源码版本后，再运行一次 `cxor`。V4 代理保留 0.1.10 的错误响应修复，并优先按旧地址轮换代理；认证健康检查同时提供脱敏的最近失败来源、固定阶段和 HTTP 状态。

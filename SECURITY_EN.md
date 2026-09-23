@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes target the current source version, `0.1.11`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
+Security fixes target the current source version, `0.1.13`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 
@@ -18,12 +18,12 @@ Security fixes target the current source version, `0.1.11`. See the [changelog](
 ## Network and Models
 
 - Except for read-only `cxor -CacheStatus`, every `cxor` run connects to OpenRouter, attempts to synchronize the latest Codex-specific model information for the current Codex CLI version, and generates and validates a local model catalog.
-- A new catalog must contain exactly one `~openai/gpt-latest` entry. A catalog that does not meet this requirement is rejected before publication.
+- `cxor` shows every model in the validated catalog by default. The default model must exist in that catalog: it prefers known entries, then falls back to the first non-`:batch` model. `~openai/gpt-latest` is no longer mandatory.
 - In OpenRouter mode, conversation requests pass through OpenRouter and may be sent to the downstream provider of the selected model. Handle sensitive data according to the policies of both services.
 - Every OpenRouter Responses request first passes through the local cache-aware proxy. Claude requests without a custom cache policy receive top-level default five-minute `ephemeral` caching and up to two breakpoints on the first and last eligible messages in the initial consecutive system/developer section. Prompt text, roles, ordering, `instructions`, and tools are preserved. Claude requests with existing cache policies and other model requests retain their original bodies. Provider-side prompt caching temporarily retains prompt prefixes in provider infrastructure; retention, billing, and data-policy details vary by model and endpoint.
 - Existing body `session_id`, header `x-session-id`, and `prompt_cache_key` are preserved. A Claude request without a routing identifier can receive an HMAC-derived routing header based on the model, `instructions`, the first system message, and tools, keyed by the local proxy token. The derived value contains no plaintext prompt, and the local token is never sent directly upstream. The proxy never automatically prewarms or retries inference. Cache markers and routing keys provide no guarantee of a hit or a particular charge.
 - The toolkit sets every model's `base_instructions` and `model_messages.instructions_template` fields to empty strings. Codex Desktop continues to provide developer context, tool definitions, and permission controls. Responses API and tool support still vary by model.
-- A failed refresh or validation never overwrites the last valid catalog. When a valid previous catalog exists, it is revalidated, reused, and accompanied by a warning. If every source fails, the switch is aborted before the running Codex Desktop process is closed.
+- A failed refresh or validation never overwrites the last valid catalog. When a valid previous catalog exists, it is revalidated, reused, and accompanied by a warning with sanitized, length-limited failure details. If every source fails, the switch is aborted before the running Codex Desktop process is closed.
 
 ## Local Changes
 

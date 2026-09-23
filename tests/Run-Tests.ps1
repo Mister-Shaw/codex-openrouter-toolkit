@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.11' `
+        -Expected '0.1.13' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -788,7 +788,7 @@ name = "keep-array-item"
 [tooling]
 keep_tooling = "yes"
 '@
-    $openRouterModel = '~openai/gpt-latest'
+    $openRouterModel = '~openai/gpt-sol-latest'
     $tomlResult = & $module {
         param(
             $Content,
@@ -1081,7 +1081,7 @@ keep_tooling = "yes"
         -Message 'Curated catalog normalizes featured display names case-insensitively'
     Assert-Equal `
         -Actual ([int]$curatedVisible[1].priority) `
-        -Expected 3 `
+        -Expected 4 `
         -Message 'Curated catalog assigns stable featured priority'
     $curatedHidden = @($curatedModels | Where-Object { $_.visibility -ceq 'hide' })
     Assert-Equal `
@@ -1134,6 +1134,7 @@ keep_tooling = "yes"
             [pscustomobject]@{
                 Label = 'provider cache'
                 Content = ''
+                Failure = "provider unavailable $ApiKey " + ('x' * 500) + 'TRUNCATED_TAIL'
                 IsPrevious = $false
             },
             [pscustomobject]@{
@@ -1141,7 +1142,7 @@ keep_tooling = "yes"
                 Content = $ValidCatalog
                 IsPrevious = $true
             }
-        ) -ApiKey $ApiKey -StandardError ''
+        ) -ApiKey $ApiKey -StandardError "remote unavailable $ApiKey"
     } $selectionCatalog $resolverKey
     Assert-Equal `
         -Actual ([string]$resolverResult.Source) `
@@ -1154,6 +1155,80 @@ keep_tooling = "yes"
         -Actual @($resolverResult.Models).Count `
         -Expected 6 `
         -Message 'Catalog resolver returns the selected models'
+    Assert-Equal `
+        -Actual ([string]$resolverResult.DefaultModel) `
+        -Expected '~openai/gpt-latest' `
+        -Message 'Catalog resolver retains the legacy alias when available'
+    Assert-True `
+        -Condition ($resolverResult.FallbackDiagnostic -like '*stdout*provider unavailable*remote unavailable*<redacted>*') `
+        -Message 'Successful fallback retains candidate failures and CLI stderr'
+    Assert-True `
+        -Condition (-not $resolverResult.FallbackDiagnostic.Contains($resolverKey)) `
+        -Message 'Successful fallback redacts API keys'
+    Assert-True `
+        -Condition (-not $resolverResult.FallbackDiagnostic.Contains('TRUNCATED_TAIL')) `
+        -Message 'Successful fallback limits individual candidate diagnostics'
+
+    $newAliasCatalog = $selectionCatalog.Replace(
+        '~openai/gpt-latest', '~openai/gpt-sol-latest'
+    )
+    foreach ($allModelsMode in @($false, $true)) {
+        $newAliasResult = & $module {
+            param($Content, $AllModels)
+            Resolve-CxCatalogCandidate -Candidates @(
+                [pscustomobject]@{ Label = 'new aliases'; Content = $Content }
+            ) -AllModels:$AllModels
+        } $newAliasCatalog $allModelsMode
+        Assert-Equal `
+            -Actual ([string]$newAliasResult.DefaultModel) `
+            -Expected '~openai/gpt-sol-latest' `
+            -Message "New alias is selected without the retired alias, AllModels=$allModelsMode"
+        Assert-Equal `
+            -Actual @($newAliasResult.Models | Where-Object {
+                $_.slug -ceq $newAliasResult.DefaultModel -and $_.visibility -ceq 'list'
+            }).Count `
+            -Expected 1 `
+            -Message 'Selected default exists and is visible in the published catalog'
+    }
+
+    $unfeaturedCatalog = '{"models":[{"slug":"vendor/model:batch"},{"slug":"vendor/interactive"}]}'
+    Assert-ThrowsLike `
+        -Action {
+            & $module {
+                param($Content)
+                Resolve-CxCatalogCandidate -Candidates @(
+                    [pscustomobject]@{ Label = 'unfeatured'; Content = $Content }
+                )
+            } $unfeaturedCatalog | Out-Null
+        }.GetNewClosure() `
+        -Pattern '*-AllModels*' `
+        -Message 'Curated mode rejects catalogs with no featured model and explains the alternative'
+    $unfeaturedAllResult = & $module {
+        param($Content)
+        Resolve-CxCatalogCandidate -Candidates @(
+            [pscustomobject]@{ Label = 'unfeatured'; Content = $Content }
+        ) -AllModels
+    } $unfeaturedCatalog
+    Assert-Equal `
+        -Actual ([string]$unfeaturedAllResult.DefaultModel) `
+        -Expected 'vendor/interactive' `
+        -Message 'All-model mode skips batch-only entries when no featured model remains'
+    foreach ($allModelsMode in @($false, $true)) {
+        Assert-ThrowsLike `
+            -Action {
+                & $module {
+                    param($AllModels)
+                    Resolve-CxCatalogCandidate -Candidates @(
+                        [pscustomobject]@{
+                            Label = 'batch only'
+                            Content = '{"models":[{"slug":"vendor/model:batch"}]}'
+                        }
+                    ) -AllModels:$AllModels
+                } $allModelsMode | Out-Null
+            }.GetNewClosure() `
+            -Pattern '*未返回可用模型目录*' `
+            -Message "Batch-only catalogs are rejected, AllModels=$allModelsMode"
+    }
 
     $resolverFailure = $null
     try {
@@ -1207,6 +1282,9 @@ keep_tooling = "yes"
                 )
 
                 $script:SyncTestProcessCalls++
+                $script:SyncTestTemporaryConfig = Read-CxTextFile `
+                    -Path (Join-Path $Environment.CODEX_HOME 'config.toml') `
+                    -MaximumBytes $script:MaximumConfigBytes
                 if (-not [string]::IsNullOrWhiteSpace($script:SyncTestCacheContent)) {
                     Write-CxTextFileAtomic `
                         -Path (Join-Path $Environment.CODEX_HOME $script:SyncTestCacheName) `
@@ -1249,7 +1327,7 @@ keep_tooling = "yes"
             $script:SyncTestDirectVersion = ''
             $script:SyncTestDirectShouldFail = $false
             $script:SyncTestDirectContent = $DirectContent
-        } $selectionCatalog
+        } $newAliasCatalog
         $directCatalogPath = Join-Path $syncTestRoot 'direct-catalog.json'
         $directSync = & $module {
             param($CatalogPath, $ApiKey)
@@ -1274,6 +1352,14 @@ keep_tooling = "yes"
             -Actual ([string]$directSync.CatalogSource) `
             -Expected 'OpenRouter Codex API' `
             -Message 'Synchronization reports the direct OpenRouter catalog source'
+        Assert-Equal `
+            -Actual ([string]$directSync.DefaultModel) `
+            -Expected '~openai/gpt-sol-latest' `
+            -Message 'Synchronization returns the default chosen from the new catalog'
+        Assert-Equal `
+            -Actual ([string]$directSync.FallbackDiagnostic) `
+            -Expected '' `
+            -Message 'Fresh direct synchronization has no fallback diagnostic'
         Assert-Equal `
             -Actual ([int]$directCounters.Version) `
             -Expected 1 `
@@ -1321,6 +1407,10 @@ keep_tooling = "yes"
             -Actual ([int]$providerSync.VisibleModelCount) `
             -Expected 5 `
             -Message 'Provider-cache synchronization applies curated visibility'
+        $temporaryConfig = & $module { $script:SyncTestTemporaryConfig }
+        Assert-True `
+            -Condition ($temporaryConfig -notmatch '(?m)^model\s*=') `
+            -Message 'CLI catalog refresh does not hardcode an inference model'
         Assert-Equal `
             -Actual @(Get-ChildItem -LiteralPath $syncTestRoot -Directory `
                 -Filter '.cxor-*' -ErrorAction SilentlyContinue).Count `
@@ -1354,6 +1444,12 @@ keep_tooling = "yes"
             -Actual ([string]$previousSync.CatalogSource) `
             -Expected '上次有效 OpenRouter 目录' `
             -Message 'Synchronization reports the previous-catalog source'
+        Assert-True `
+            -Condition ($previousSync.FallbackDiagnostic -like '*direct catalog unavailable*<redacted>*remote catalog unavailable*') `
+            -Message 'Synchronization preserves the reasons for using an old catalog'
+        Assert-True `
+            -Condition (-not $previousSync.FallbackDiagnostic.Contains($resolverKey)) `
+            -Message 'Synchronization fallback diagnostics never expose the API key'
 
         $previousAllSync = & $module {
             param($CatalogPath, $ApiKey)
@@ -1617,7 +1713,7 @@ keep_tooling = "yes"
                 Path = $CatalogPath
                 ModelCount = 3
                 VisibleModelCount = if ($AllModels) { 3 } else { 2 }
-                DefaultModel = '~openai/gpt-latest'
+                DefaultModel = '~openai/gpt-sol-latest'
                 CatalogSource = 'test catalog'
                 UsedPreviousCatalog = $false
             }
@@ -1743,12 +1839,12 @@ keep_tooling = "yes"
         -Message 'Two successful cxor calls ensure the cache proxy twice'
     Assert-Equal `
         -Actual ($orchestration.AfterTwo.Models -join ',') `
-        -Expected '~openai/gpt-latest,~openai/gpt-latest' `
+        -Expected '~openai/gpt-sol-latest,~openai/gpt-sol-latest' `
         -Message 'cxor writes the default model returned by each synchronization'
     Assert-Equal `
         -Actual ($orchestration.AfterTwo.AllModels -join ',') `
-        -Expected 'False,True' `
-        -Message 'cxor passes curated and all-model modes to synchronization'
+        -Expected 'True,True' `
+        -Message 'cxor defaults to all models and retains the explicit compatibility switch'
     Assert-Equal `
         -Actual $orchestration.AfterFailure.Sync `
         -Expected 3 `
@@ -1771,11 +1867,11 @@ keep_tooling = "yes"
         -Message 'Synchronization failure does not start the cache proxy'
     Assert-Equal `
         -Actual ($orchestration.AfterFailure.Models -join ',') `
-        -Expected '~openai/gpt-latest,~openai/gpt-latest' `
+        -Expected '~openai/gpt-sol-latest,~openai/gpt-sol-latest' `
         -Message 'Synchronization failure does not prepare a stale model config'
     Assert-Equal `
         -Actual ($orchestration.AfterFailure.AllModels -join ',') `
-        -Expected 'False,True,False' `
+        -Expected 'True,True,True' `
         -Message 'Failed synchronization still records the requested catalog mode'
     Assert-True `
         -Condition ($orchestration.AfterFailure.Failure -like '*synchronization failure*') `

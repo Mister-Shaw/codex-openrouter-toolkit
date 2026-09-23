@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.11`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.13`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -13,12 +13,12 @@ A community-maintained Windows PowerShell toolkit that switches Codex Desktop be
 | --- | --- |
 | `cx` | Removes the toolkit-managed model and OpenRouter settings, keeps the proxy available to open tasks, and requests that Codex Desktop open in its default mode. |
 | `cx -StopProxy` | Returns to default Codex and immediately stops the local proxy. Open OpenRouter tasks can no longer use that loopback endpoint. |
-| `cxor` | Synchronizes the latest Codex-compatible OpenRouter catalog, starts the local cache-aware proxy, shows a curated set of Claude and OpenAI models, switches to OpenRouter, and requests a desktop restart. |
+| `cxor` | Synchronizes the latest Codex-compatible OpenRouter catalog, starts the local cache-aware proxy, shows all models by default, switches to OpenRouter, and requests a desktop restart. |
 | `cxor -SetKey` | Securely prompts for and stores or rotates the current Windows user's OpenRouter API key, then enters OpenRouter mode. |
-| `cxor -AllModels` | Makes every model in the selected validated OpenRouter catalog visible. May be combined with `-SetKey`. |
+| `cxor -AllModels` | Compatibility spelling with the same behavior as `cxor`; this switch is no longer needed. |
 | `cxor -CacheStatus` | Reads local Claude cache usage and the latest reported cost without calling a model, refreshing the catalog, or restarting Desktop. |
 
-Except for read-only `-CacheStatus`, every `cxor` run queries the fixed HTTPS URL `https://openrouter.ai/api/v1/models` with the current Codex CLI three-part version as `client_version` and the `originator: Codex Desktop` header. HTTP redirects are disabled, and no 24-hour cache is used. If the direct response is unavailable or fails validation, the toolkit checks Codex CLI stdout, the provider-specific temporary cache, the generic temporary cache, other temporary model caches, and the last valid catalog. A candidate is published only after its structure, model IDs, duplicate entries, default entry, and prompt fields pass validation. Reusing the last valid catalog produces a warning. If every source fails, the switch stops before the Codex configuration is modified or the running desktop process is closed. `-AllModels` marks every entry in the selected catalog as visible.
+Except for read-only `-CacheStatus`, every `cxor` run queries the fixed HTTPS URL `https://openrouter.ai/api/v1/models` with the current Codex CLI three-part version as `client_version` and the `originator: Codex Desktop` header. HTTP redirects are disabled, and no 24-hour cache is used. If the direct response is unavailable or fails validation, the toolkit checks Codex CLI stdout, the provider-specific temporary cache, the generic temporary cache, other temporary model caches, and the last valid catalog. A candidate is published only after its structure, model IDs, duplicate entries, default model, and prompt fields pass validation. Reusing the last valid catalog produces a warning with sanitized, length-limited failure details. If every source fails, the switch stops before the Codex configuration is modified or the running desktop process is closed. `cxor` marks every entry in the selected catalog as visible by default.
 
 ## Requirements
 
@@ -51,19 +51,19 @@ The command performs these steps:
 
 1. Retrieves the latest OpenRouter model catalog and generates a Codex Desktop-compatible catalog.
 2. Sets every model's `base_instructions` and `model_messages.instructions_template` fields to empty strings.
-3. Shows nine curated Claude and OpenAI entries by default and hides all other catalog entries.
+3. Shows every model in the validated catalog.
 4. Starts the cache-aware proxy on a random loopback port and verifies its health.
 5. Updates the Codex configuration and asks Windows to restart Codex Desktop.
 6. Lets you select a catalog model from the Desktop model selector in a new Codex task.
 
-The catalog must contain exactly one `~openai/gpt-latest` entry, which is used as the initial model. Synchronization stops before publishing if that entry is missing. Curated mode retains the complete catalog and sets unselected entries to `visibility = "hide"`, preserving compatibility with existing tasks that reference older slugs.
+The initial model is the first available entry in the priority order below, preferring `~openai/gpt-latest`, then `~openai/gpt-sol-latest`. If none remain, it uses the first non-`:batch` model in the catalog. All models stay visible.
 
-Default curated models:
+Default model priority order:
 
-- GPT Latest, GPT-5.6 Sol Pro, GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.3 Codex
+- GPT Latest, GPT Sol Latest, GPT-5.6 Sol Pro, GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.3 Codex
 - Claude Opus Latest, Claude Opus 5, Claude Sonnet Latest, Claude Sonnet 5
 
-Show the complete validated catalog:
+This older spelling remains compatible and has the same effect as `cxor`:
 
 ```powershell
 cxor -AllModels
@@ -142,8 +142,9 @@ The uninstaller stops the local proxy and removes its state, the user module, to
 ## Troubleshooting
 
 - `cx` or `cxor` cannot be found: install with PowerShell 7.4 or later and confirm that the user module directory is present in `$env:PSModulePath`.
-- Catalog synchronization fails: check the key, account balance, network connection, and OpenRouter service status. The last valid catalog is preserved. If no valid fallback is available, the switch stops before the running desktop process is closed.
-- Empty `Content` errors, damaged CLI JSON, system-temp PATH alias warnings, or repeated stale-catalog warnings: update to version `0.1.8`. The catalog fixes force UTF-8 decoding for Codex CLI stdout and stderr, prioritize the direct OpenRouter catalog request, and use an automatically removed short-lived CLI home beside the catalog file.
+- Catalog synchronization fails: use the sanitized warning details to check the key, network connection, and OpenRouter service status. The last valid catalog is preserved, revalidated, and reused with a warning when available. If no valid fallback is available, the switch stops before the running desktop process is closed.
+- Repeated stale-catalog warnings: install the current source version, `0.1.13`. Older versions require `~openai/gpt-latest` and reject valid new catalogs that have removed that entry. The new version supports `~openai/gpt-sol-latest` and selects the default model dynamically. `cxor` now shows all models by default.
+- Empty `Content` errors, damaged CLI JSON, or system-temp PATH alias warnings: install the current source version. Catalog synchronization uses UTF-8 decoding for Codex CLI stdout and stderr, prioritizes the direct OpenRouter catalog request, and uses an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.
 - `502 Bad Gateway`: install the current source version and run `cxor` once. The V4 proxy retains the 0.1.10 error-response fixes and reuses the existing loopback port when available. Its authenticated health endpoint also exposes sanitized failure source, fixed phase, and HTTP status diagnostics.

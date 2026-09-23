@@ -9,6 +9,7 @@ $script:ProxyHeaderName = 'x-cxor-proxy-token'
 $script:EmptyInstructions = ''
 $script:FeaturedModels = @(
     [pscustomobject]@{ Slug = '~openai/gpt-latest'; DisplayName = 'GPT Latest' }
+    [pscustomobject]@{ Slug = '~openai/gpt-sol-latest'; DisplayName = 'GPT Sol Latest' }
     [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol-pro'; DisplayName = 'GPT-5.6 Sol Pro' }
     [pscustomobject]@{ Slug = 'openai/gpt-5.6-sol'; DisplayName = 'GPT-5.6 Sol' }
     [pscustomobject]@{ Slug = 'openai/gpt-5.6-terra'; DisplayName = 'GPT-5.6 Terra' }
@@ -315,7 +316,7 @@ function Update-CxConfigContent {
         [string]$ProxyBaseUrl,
         [string]$ProxyToken,
         [string]$ProxyStatePath,
-        [string]$Model = '~openai/gpt-latest'
+        [string]$Model
     )
 
     if ($Mode -eq 'OpenRouter' -and
@@ -502,7 +503,7 @@ function Get-CxConfigChange {
         [string]$ProxyBaseUrl,
         [string]$ProxyToken,
         [string]$ProxyStatePath,
-        [string]$Model = '~openai/gpt-latest'
+        [string]$Model
     )
 
     $fingerprintBefore = Get-CxFileFingerprint $Path
@@ -2588,6 +2589,8 @@ function Resolve-CxCatalogCandidate {
     )
 
     $failures = [Collections.Generic.List[string]]::new()
+    $safeError = Protect-CxText $StandardError $ApiKey
+    if ($safeError.Length -gt 1000) { $safeError = $safeError.Substring(0, 1000) + '…' }
     foreach ($candidate in $Candidates) {
         $labelProperty = if ($null -eq $candidate) {
             $null
@@ -2628,16 +2631,33 @@ function Resolve-CxCatalogCandidate {
             $converted = Convert-CxCatalogPrompt -Content $candidateContent `
                 -AllModels:$AllModels
             $convertedModels = @(($converted | ConvertFrom-Json -ErrorAction Stop).models)
-            if (@($convertedModels | Where-Object {
-                        $_.slug -ceq '~openai/gpt-latest'
-                    }).Count -ne 1) {
-                throw '缺少官方默认入口 ~openai/gpt-latest。'
+            $defaultModel = $null
+            foreach ($definition in $script:FeaturedModels) {
+                $defaultModel = $convertedModels | Where-Object {
+                    $_.slug -ieq $definition.Slug
+                } | Select-Object -First 1
+                if ($null -ne $defaultModel) { break }
+            }
+            if ($null -eq $defaultModel -and $AllModels) {
+                $defaultModel = $convertedModels | Where-Object {
+                    $_.slug -notlike '*:batch'
+                } | Select-Object -First 1
+            }
+            if ($null -eq $defaultModel) {
+                throw '目录缺少可用的默认模型；精选入口均不可用时可尝试 cxor -AllModels。'
             }
             $previousProperty = $candidate.PSObject.Properties['IsPrevious']
             return [pscustomobject]@{
                 Content = $converted
                 Models = $convertedModels
+                DefaultModel = [string]$defaultModel.slug
                 Source = $label
+                FallbackDiagnostic = (@(
+                    $failures
+                    if (-not [string]::IsNullOrWhiteSpace($safeError)) {
+                        "Codex CLI stderr：$($safeError.Trim())"
+                    }
+                ) -join '；')
                 UsedPreviousCatalog = $null -ne $previousProperty -and
                     [bool]$previousProperty.Value
             }
@@ -2655,8 +2675,6 @@ function Resolve-CxCatalogCandidate {
         '没有候选来源'
     }
     else { $failures -join '；' }
-    $safeError = Protect-CxText $StandardError $ApiKey
-    if ($safeError.Length -gt 1000) { $safeError = $safeError.Substring(0, 1000) + '…' }
     $errorDetail = if ([string]::IsNullOrWhiteSpace($safeError)) { '无' } else { $safeError.Trim() }
     throw "OpenRouter 与 Codex CLI 未返回可用模型目录。候选检查：$candidateDetail。Codex CLI stderr：$errorDetail"
 }
@@ -2714,7 +2732,6 @@ function Sync-CxOpenRouterCatalog {
             $provider = New-CxProviderBlock -AuthCommand $AuthCommand `
                 -Direct -ReadProcessEnvironment
             $temporaryConfig = @(
-                'model = "~openai/gpt-latest"'
                 'model_provider = "openrouter"'
                 ''
                 $provider
@@ -2791,8 +2808,9 @@ function Sync-CxOpenRouterCatalog {
             VisibleModelCount = @($writtenModels | Where-Object {
                 $_.PSObject.Properties['visibility'] -and $_.visibility -ceq 'list'
             }).Count
-            DefaultModel = '~openai/gpt-latest'
+            DefaultModel = [string]$resolvedCatalog.DefaultModel
             CatalogSource = [string]$resolvedCatalog.Source
+            FallbackDiagnostic = [string]$resolvedCatalog.FallbackDiagnostic
             UsedPreviousCatalog = [bool]$resolvedCatalog.UsedPreviousCatalog
         }
     }
@@ -2943,7 +2961,8 @@ function Invoke-CxMode {
                     -CatalogPath $paths.CatalogPath -AuthCommand $authCommand `
                     -AllModels:$AllModels
                 if ($catalogResult.UsedPreviousCatalog) {
-                    Write-Warning 'OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。'
+                    Write-Warning ("OpenRouter 与 Codex CLI 未返回可用的新目录，已使用上次有效 OpenRouter 目录。原因：" +
+                        $catalogResult.FallbackDiagnostic)
                 }
                 $proxy = Ensure-CxOpenRouterProxy -StatePath $paths.ProxyStatePath
                 $change = Get-CxConfigChange -Path $paths.ConfigPath -Mode OpenRouter `
@@ -3032,7 +3051,7 @@ function cxor {
         if ($SetKey -or $AllModels) { throw '-CacheStatus 不能与 -SetKey 或 -AllModels 同时使用。' }
         return Get-CxClaudeCacheStatus
     }
-    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey -AllModels:$AllModels
+    Invoke-CxMode -Mode OpenRouter -SetKey:$SetKey -AllModels
 }
 
 Export-ModuleMember -Function @('cx', 'cxor')
