@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.16 - 2026-10-19
+
+- 修复 OpenRouter 模式因持久化 Work 视图触发 `Work browser access requires an authenticated account` 而无法开始对话的问题：`cxor` 仅在 `desktop.conversationDetailMode` 为 `STEPS_PROSE` 时将其改为 Codex 的 `STEPS_COMMANDS`，并保存恢复注释。
+- `cx` 与卸载器恢复由工具包切换且仍保持受管值的 Work 视图；用户后续选择的其他视图及其他配置保持不变。兼容处理不修改登录凭据或浏览器权限。
+- 同步中英文使用、安全与故障排查说明。此修复的真实桌面对话流程仍需验证。
+
 ## 0.1.15 - 2026-09-23
 
 - Claude 请求无自定义缓存策略时，仅加入顶层 `cache_control: {"type":"ephemeral"}`，适配 OpenRouter Responses API 支持的上游自动缓存，默认有效期仍为 5 分钟。

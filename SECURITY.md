@@ -4,7 +4,7 @@
 
 ## 支持版本
 
-安全修复面向当前源码版本 `0.1.15`。发布状态见 [变更记录](CHANGELOG.md)；旧版本用户应先更新，再确认问题是否仍然存在。
+安全修复面向当前源码版本 `0.1.16`。发布状态见 [变更记录](CHANGELOG.md)；旧版本用户应先更新，再确认问题是否仍然存在。
 
 ## API Key
 
@@ -33,7 +33,9 @@
 
 `cxor -CacheStatus` 只读访问当前代理的认证健康接口，不调用模型、不刷新目录、不启动或重启代理及桌面端。V6 代理对响应做有界内存解析并透传原始字节，健康信息仅保留累计计数、最近 token/费用数字和固定状态；不保存模型 ID、提示、响应正文或逐条请求历史。统计随代理退出而清空，不会写入状态文件。无法解析或缺失的用量保持未知，聚合统计无法证明整个系统提示命中缓存。
 
-运行 `cx` 会移除 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置；经过身份校验的后台代理与状态文件继续服务已经打开的 OpenRouter 任务。运行 `cx -StopProxy` 或卸载器会停止代理并清理状态文件，卸载器还会清理目录。
+`cxor` 发现 `config.toml` 中的 `desktop.conversationDetailMode` 为 Work 的 `STEPS_PROSE` 时，会改为 Codex 的 `STEPS_COMMANDS` 并保存恢复注释，以避开当前 Work 浏览器准备流程与自定义供应商的兼容问题。该兼容处理不修改登录凭据、浏览器权限或其他桌面设置，也不绕过 Work 身份验证。
+
+运行 `cx` 会移除 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，恢复由工具包切换且仍保持 `STEPS_COMMANDS` 的 Work 视图；用户后续选择的其他视图及其他配置保持不变。经过身份校验的后台代理与状态文件继续服务已经打开的 OpenRouter 任务。运行 `cx -StopProxy` 或卸载器会停止代理并清理状态文件，卸载器还会清理目录，并按相同规则恢复视图。
 
 工具包不操作 `models_cache.json`，也不创建 `settings.json` 或持续备份。受管文本采用同目录临时文件替换，并在提交前检查并发修改。重要的自定义 Codex 配置仍建议由用户自行备份。
 

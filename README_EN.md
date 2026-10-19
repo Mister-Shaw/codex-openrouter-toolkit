@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.15`.
+A community-maintained Windows PowerShell toolkit that switches Codex Desktop between its default mode and OpenRouter mode with two short commands. Current version: `0.1.16`.
 
 > [!IMPORTANT]
 > This project is not endorsed by OpenAI or OpenRouter. Codex Desktop, custom model providers, and the model-catalog format may change. Revalidate the toolkit after updating Codex.
@@ -53,7 +53,7 @@ The command performs these steps:
 2. Sets every model's `base_instructions` and `model_messages.instructions_template` fields to empty strings.
 3. Shows every model in the validated catalog.
 4. Starts the cache-aware proxy on a random loopback port and verifies its health.
-5. Updates the Codex configuration and asks Windows to restart Codex Desktop.
+5. Updates the Codex configuration, switches a persisted Work view to Codex when needed, and asks Windows to restart Codex Desktop.
 6. Lets you select a catalog model from the Desktop model selector in a new Codex task.
 
 The initial model is the first available entry in the priority order below, preferring `~openai/gpt-latest`, then `~openai/gpt-sol-latest`. If none remain, it uses the first non-`:batch` model in the catalog. All models stay visible.
@@ -75,7 +75,7 @@ Return to default Codex mode:
 cx
 ```
 
-`cx` removes the toolkit-managed `model`, `model_provider`, `model_reasoning_effort`, and `model_catalog_json` keys, together with the managed OpenRouter provider block. Other Codex settings are preserved, and Codex Desktop is asked to reopen. The proxy and its state file remain available by default so OpenRouter tasks that already hold the loopback address can finish. Run `cx -StopProxy` to stop it immediately.
+`cx` removes the toolkit-managed `model`, `model_provider`, `model_reasoning_effort`, and `model_catalog_json` keys, together with the managed OpenRouter provider block, restores a Work view changed by the toolkit, and asks Codex Desktop to reopen. If you subsequently selected a different view, that choice is preserved; other settings remain unchanged. The proxy and its state file remain available by default so OpenRouter tasks that already hold the loopback address can finish. Run `cx -StopProxy` to stop it immediately.
 
 Rotate the API key:
 
@@ -84,6 +84,8 @@ cxor -SetKey
 ```
 
 The key is stored in the current Windows user's `OPENROUTER_API_KEY` environment variable. The OpenRouter provider's persistent command authentication reads the user-scoped value directly, avoiding stale values inherited by Terminal or Explorer.
+
+View restoration uses the trailing `# CodexOpenRouter restore Work view` comment. Remove that comment to keep Codex view when returning to the default provider; selecting the same Codex view value again cannot reliably signal that restoration should be cancelled.
 
 ## Empty Base Instructions
 
@@ -138,13 +140,14 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 ```
 
-The uninstaller stops the local proxy and removes its state, the user module, toolkit-managed Codex configuration, OpenRouter catalog, and legacy profile blocks. The OpenRouter key is removed only when the uninstaller is run with `-RemoveApiKey`.
+The uninstaller stops the local proxy and removes its state, the user module, toolkit-managed Codex configuration, OpenRouter catalog, and legacy profile blocks. It restores a Work view changed by the toolkit under the same rules as `cx`. The OpenRouter key is removed only when the uninstaller is run with `-RemoveApiKey`.
 
 ## Troubleshooting
 
+- Conversations cannot start and show `Work browser access requires an authenticated account`: the current Work browser setup flow has a compatibility issue with custom providers such as OpenRouter. Explicitly select the Codex view in the app, or install `0.1.16` and run `cxor` again. A previous persisted view may still be Work even when the interface shows Codex. The new version changes `desktop.conversationDetailMode` from `STEPS_PROSE` to `STEPS_COMMANDS` only when needed and saves a restoration comment; it does not change login credentials or browser permissions. Use default mode with the appropriate account authentication for Work.
 - `cx` or `cxor` cannot be found: install with PowerShell 7.4 or later and confirm that the user module directory is present in `$env:PSModulePath`.
 - Catalog synchronization fails: use the sanitized warning details to check the key, network connection, and OpenRouter service status. The last valid catalog is preserved, revalidated, and reused with a warning when available. If no valid fallback is available, the switch stops before the running desktop process is closed.
-- Repeated stale-catalog warnings: install the current source version, `0.1.15`. Older versions require `~openai/gpt-latest` and reject valid new catalogs that have removed that entry. The new version supports `~openai/gpt-sol-latest` and selects the default model dynamically. `cxor` now shows all models by default.
+- Repeated stale-catalog warnings: install the current source version, `0.1.16`. Older versions require `~openai/gpt-latest` and reject valid new catalogs that have removed that entry. The new version supports `~openai/gpt-sol-latest` and selects the default model dynamically. `cxor` now shows all models by default.
 - Empty `Content` errors, damaged CLI JSON, or system-temp PATH alias warnings: install the current source version. Catalog synchronization uses UTF-8 decoding for Codex CLI stdout and stderr, prioritizes the direct OpenRouter catalog request, and uses an automatically removed short-lived CLI home beside the catalog file.
 - Old models remain visible after switching: fully close Codex Desktop, run the appropriate command again, and create a new task.
 - A visible model fails when invoked: confirm that the model supports the Responses API and tools required by Codex.

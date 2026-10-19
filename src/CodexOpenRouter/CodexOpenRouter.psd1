@@ -1,6 +1,6 @@
 @{
     RootModule = 'CodexOpenRouter.psm1'
-    ModuleVersion = '0.1.15'
+    ModuleVersion = '0.1.16'
     GUID = 'be74dba0-28ed-4ba3-adff-f0fc0d107b39'
     Author = 'Mister-Shaw'
     CompanyName = 'Community'

@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.15`。
+一个面向 Windows 的社区工具，用 PowerShell 短命令切换 Codex Desktop 的默认模式与 OpenRouter 模式。当前版本：`0.1.16`。
 
 > [!IMPORTANT]
 > 本项目未经 OpenAI 或 OpenRouter 官方背书。Codex Desktop、自定义模型供应商和模型目录格式仍可能变化；更新 Codex 后请重新验证。
@@ -53,7 +53,7 @@ cxor
 2. 将每个模型的 `base_instructions` 与 `model_messages.instructions_template` 写为空字符串。
 3. 显示通过校验的目录中的全部模型。
 4. 在随机本地环回端口启动缓存感知代理，并完成健康检查。
-5. 更新 Codex 配置，并向 Windows 提交桌面端重启请求。
+5. 更新 Codex 配置；如持久化视图为 Work，自动切换为 Codex，并向 Windows 提交桌面端重启请求。
 6. 在新的 Codex 任务中，从桌面模型选择器选择目录内模型。
 
 初始模型按下列优先顺序选择目录中实际存在的入口，优先使用 `~openai/gpt-latest`，其次是 `~openai/gpt-sol-latest`；这些入口均不存在时，使用目录中首个非 `:batch` 模型。全部模型保持可见。
@@ -75,7 +75,9 @@ cxor -AllModels
 cx
 ```
 
-`cx` 会从 `config.toml` 移除工具包托管的 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，同时保留其他配置，并请求重新打开 Codex Desktop。代理与状态文件默认保留，使已经打开且仍持有原环回地址的 OpenRouter 任务可以完成。需要立即结束代理时运行 `cx -StopProxy`。
+`cx` 会从 `config.toml` 移除工具包托管的 `model`、`model_provider`、`model_reasoning_effort`、`model_catalog_json` 与 OpenRouter provider，恢复由工具包切换的 Work 视图，并请求重新打开 Codex Desktop。若用户后来改为其他视图，则保留用户选择；其他配置保持不变。代理与状态文件默认保留，使已经打开且仍持有原环回地址的 OpenRouter 任务可以完成。需要立即结束代理时运行 `cx -StopProxy`。
+
+视图恢复依赖设置行末的 `# CodexOpenRouter restore Work view` 注释。如果希望返回默认模式后仍保留 Codex 视图，请移除该注释；再次选择相同的 Codex 视图值无法可靠区分是否要取消恢复。
 
 需要轮换 Key 时运行：
 
@@ -138,13 +140,14 @@ pwsh -NoProfile -File .\scripts\Install-CodexOpenRouter.ps1
 pwsh -NoProfile -File .\scripts\Uninstall-CodexOpenRouter.ps1
 ```
 
-卸载器会停止本地代理，并移除代理状态、用户模块、工具包托管的 Codex 配置、OpenRouter 目录和旧 Profile 区块。OpenRouter Key 只有在使用 `-RemoveApiKey` 时才会删除。
+卸载器会停止本地代理，并移除代理状态、用户模块、工具包托管的 Codex 配置、OpenRouter 目录和旧 Profile 区块。由工具包切换的 Work 视图按 `cx` 的相同规则恢复。OpenRouter Key 只有在使用 `-RemoveApiKey` 时才会删除。
 
 ## 常见问题
 
+- 无法开始对话，提示 `Work browser access requires an authenticated account`：当前 Work 浏览器准备流程与 OpenRouter 等自定义供应商存在兼容问题。请在应用中显式选择「Codex」视图，或安装 `0.1.16` 后重新运行 `cxor`。即使界面显示 Codex，旧的持久化视图值也可能仍是 Work。新版只在 `desktop.conversationDetailMode` 为 `STEPS_PROSE` 时将其改为 `STEPS_COMMANDS`，并保存恢复注释；不会修改登录凭据或浏览器权限。Work 视图需要使用默认模式与相应账户认证。
 - 找不到 `cx` / `cxor`：确认安装使用 PowerShell 7.4+，并检查用户模块目录是否位于 `$env:PSModulePath`。
 - 目录同步失败：根据警告中的脱敏原因检查 Key、网络和 OpenRouter 服务状态。最后有效目录会保留；存在有效旧目录时会重新校验后复用并显示警告。无有效回退来源时，本次切换会在关闭桌面端前中止。
-- 持续显示旧目录告警：安装当前源码版本 `0.1.15`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
+- 持续显示旧目录告警：安装当前源码版本 `0.1.16`。旧版本强制要求 `~openai/gpt-latest`，会拒绝已移除该入口的有效新目录；新版本支持 `~openai/gpt-sol-latest` 并动态选择默认模型。`cxor` 默认显示全部模型。
 - 遇到 `Content` 为空、CLI JSON 损坏或系统临时目录 PATH alias 警告：安装当前源码版本；目录同步固定使用 UTF-8 读取 CLI 输出，优先请求 OpenRouter Codex 专用目录，并在目录文件旁使用自动清理的短期 CLI home。
 - 切换后仍显示旧模型：完全关闭 Codex Desktop，重新运行相应命令并创建新任务。
 - 模型可见但调用失败：确认该模型支持 Codex 使用的 Responses API 与所需工具。

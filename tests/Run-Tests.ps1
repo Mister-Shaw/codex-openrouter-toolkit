@@ -88,7 +88,7 @@ try {
     $manifest = Import-PowerShellDataFile -LiteralPath $moduleManifest
     Assert-Equal `
         -Actual $manifest.ModuleVersion.ToString() `
-        -Expected '0.1.15' `
+        -Expected '0.1.16' `
         -Message 'Module version'
     $manifestExports = @($manifest.FunctionsToExport | Sort-Object)
     Assert-Equal `
@@ -1032,6 +1032,102 @@ keep_tooling = "yes"
             '[model_providers.openrouter]'
         )) `
         -Message 'Default TOML removes the OpenRouter provider'
+
+    $workViewResults = & $module {
+        param($CatalogPath, $AuthCommand, $ProxyBaseUrl, $ProxyToken, $ProxyStatePath, $Model)
+        $arguments = @{
+            Mode = 'OpenRouter'; CatalogPath = $CatalogPath; AuthCommand = $AuthCommand
+            ProxyBaseUrl = $ProxyBaseUrl; ProxyToken = $ProxyToken
+            ProxyStatePath = $ProxyStatePath; Model = $Model
+        }
+        $marker = ' # CodexOpenRouter restore Work view'
+        $fixtures = @(
+            "[desktop]`nconversationDetailMode = `"STEPS_PROSE`" # keep comment`nlocaleOverride = `"zh-CN`""
+            "['desktop']`r`n'conversationDetailMode' = 'STEPS_PROSE'`r`n[desktop.other]`r`nconversationDetailMode = 'STEPS_PROSE'"
+            "`"desktop`" . `"conversationDetailMode`" = `"STEPS_PROSE`"`n[features]`njs_repl = false"
+        )
+        foreach ($fixture in $fixtures) {
+            $openRouter = Update-CxConfigContent -Content $fixture @arguments
+            [pscustomobject]@{
+                Input = $fixture
+                OpenRouter = $openRouter
+                Again = Update-CxConfigContent -Content $openRouter @arguments
+                Restored = Update-CxConfigContent -Content $openRouter -Mode Default
+                MarkerWhitespace = Update-CxConfigContent -Content (
+                    $openRouter.Replace($marker, $marker + " `t")) -Mode Default
+                ManualExecution = Update-CxConfigContent -Content (
+                    $openRouter.Replace('STEPS_COMMANDS', 'STEPS_EXECUTION')) -Mode Default
+                MarkerRemoved = Update-CxConfigContent -Content (
+                    $openRouter.Replace($marker, '')) -Mode Default
+                ViewRemoved = Update-CxConfigContent -Content (
+                    [regex]::Replace($openRouter, '(?m)^.*STEPS_COMMANDS[^\r\n]*\r?\n?', '')) -Mode Default
+            }
+        }
+        foreach ($fixture in @(
+                "[desktop]`nconversationDetailMode = 'STEPS_COMMANDS'"
+                "[desktop]`nconversationDetailMode = 'STEPS_EXECUTION'"
+                "[desktop]`nlocaleOverride = 'zh-CN'"
+                "[other]`nconversationDetailMode = 'STEPS_PROSE'"
+                "[Desktop]`nconversationDetailMode = 'STEPS_PROSE'"
+                "instructions = '''`n[desktop]`nconversationDetailMode = 'STEPS_PROSE'`n'''"
+                ''
+            )) {
+            $openRouter = Update-CxConfigContent -Content $fixture @arguments
+            [pscustomobject]@{
+                UnchangedInput = $fixture
+                OpenRouter = $openRouter
+                Restored = Update-CxConfigContent -Content $openRouter -Mode Default
+            }
+        }
+        foreach ($fixture in @(
+                'desktop = { conversationDetailMode = "STEPS_PROSE" }'
+                "[desktop]`nconversationDetailMode = '''STEPS_PROSE'''"
+                "[desktop]`nconversationDetailMode = 'STEPS_PROSE'`nconversationDetailMode = 'STEPS_COMMANDS'"
+                "[desktop]`nconversationDetailMode = 'STEPS_COMMANDS'$marker$marker"
+            )) {
+            $rejected = $false
+            try { [void](Update-CxConfigContent -Content $fixture @arguments) }
+            catch { $rejected = $true }
+            [pscustomobject]@{ Rejected = $rejected; UnsupportedInput = $fixture }
+        }
+    } $catalogPath $authCommand $proxyBaseUrl $proxyToken $proxyStatePath $openRouterModel
+    foreach ($result in $workViewResults) {
+        if ($null -ne $result.PSObject.Properties['Input']) {
+            Assert-True -Condition $result.OpenRouter.Contains('STEPS_COMMANDS') `
+                -Message 'Work view switches to Codex view for OpenRouter'
+            Assert-Equal -Actual ([regex]::Matches($result.OpenRouter,
+                    '# CodexOpenRouter restore Work view').Count) -Expected 1 `
+                -Message 'Only the desktop view receives a restore marker'
+            Assert-Equal -Actual $result.Again -Expected $result.OpenRouter `
+                -Message 'Repeated cxor preserves the original Work view'
+            Assert-Equal -Actual $result.Restored -Expected ($result.Input + "`r`n") `
+                -Message 'cx restores Work view including comments and quoting'
+            Assert-Equal -Actual ($result.MarkerWhitespace -replace '(?m)[ \t]+(?=\r?$)', '') `
+                -Expected ($result.Input + "`r`n") `
+                -Message 'Trailing whitespace after the marker does not prevent Work view restoration'
+            Assert-Equal -Actual $result.ManualExecution `
+                -Expected ([regex]::new('STEPS_PROSE').Replace($result.Input, 'STEPS_EXECUTION', 1) + "`r`n") `
+                -Message 'cx respects a later manual view change and removes the restore marker'
+            Assert-True -Condition ($result.MarkerRemoved.Contains('STEPS_COMMANDS') -and
+                -not $result.MarkerRemoved.Contains('# CodexOpenRouter restore Work view')) `
+                -Message 'Removing the restore marker keeps Codex view on cx'
+            Assert-True -Condition (-not $result.ViewRemoved.Contains('STEPS_COMMANDS') -and
+                -not $result.ViewRemoved.Contains('# CodexOpenRouter restore Work view')) `
+                -Message 'cx does not recreate a manually removed view setting'
+        }
+        elseif ($null -ne $result.PSObject.Properties['UnchangedInput']) {
+            $expected = if ($result.UnchangedInput.Length -eq 0) { '' }
+                else { $result.UnchangedInput + "`r`n" }
+            Assert-Equal -Actual $result.Restored -Expected $expected `
+                -Message 'Missing, non-Work and unrelated view settings remain unchanged'
+            Assert-True -Condition (-not $result.OpenRouter.Contains('# CodexOpenRouter restore Work view')) `
+                -Message 'Unchanged view settings do not receive a restore marker'
+        }
+        else {
+            Assert-True -Condition $result.Rejected `
+                -Message 'Unsupported desktop syntax is rejected before changing configuration'
+        }
+    }
 
     $multilineManagedValues = @'
 model = """\

@@ -4,7 +4,7 @@
 
 ## Supported Version
 
-Security fixes target the current source version, `0.1.15`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
+Security fixes target the current source version, `0.1.16`. See the [changelog](CHANGELOG.md) for release status. Users of older versions should update before checking whether an issue still occurs.
 
 ## API Key
 
@@ -33,7 +33,9 @@ Except with `-CacheStatus`, running `cxor` writes `<CODEX_HOME>/openrouter-model
 
 `cxor -CacheStatus` only reads the current proxy's authenticated health endpoint. It calls no model, refreshes no catalog, and does not start or restart the proxy or Desktop. The V6 proxy performs bounded in-memory response parsing while forwarding the original bytes. Health diagnostics retain aggregate counters, the latest numeric token/cost values, and fixed statuses, with no model IDs, prompts, response bodies, or per-request history. Statistics disappear when the proxy exits and are never written to its state file. Missing or unparseable usage remains unknown; aggregate statistics cannot prove that the entire system prompt was cached.
 
-Running `cx` removes `model`, `model_provider`, `model_reasoning_effort`, `model_catalog_json`, and the managed OpenRouter provider while preserving other configuration. The verified background proxy and state file remain available to OpenRouter tasks that are already open. Running `cx -StopProxy` or the uninstaller stops the proxy and removes its state; the uninstaller also removes the catalog.
+When `desktop.conversationDetailMode` in `config.toml` is Work's `STEPS_PROSE`, `cxor` changes it to Codex's `STEPS_COMMANDS` and saves a restoration comment to avoid the current compatibility issue between Work browser setup and custom providers. This compatibility change does not modify login credentials, browser permissions, or other desktop settings, and it does not bypass Work authentication.
+
+Running `cx` removes `model`, `model_provider`, `model_reasoning_effort`, `model_catalog_json`, and the managed OpenRouter provider, and restores a Work view changed by the toolkit if it still has the managed `STEPS_COMMANDS` value. Any different view subsequently selected by the user and other configuration are preserved. The verified background proxy and state file remain available to OpenRouter tasks that are already open. Running `cx -StopProxy` or the uninstaller stops the proxy and removes its state; the uninstaller also removes the catalog and restores the view under the same rules.
 
 The toolkit does not modify `models_cache.json`, create `settings.json`, or maintain persistent backups. Managed text is replaced with a temporary file in the same directory, and concurrent modification is checked before commit. Back up important custom Codex configuration separately.
 

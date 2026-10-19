@@ -348,9 +348,14 @@ function Update-CxConfigContent {
     $kept = [Collections.Generic.List[string]]::new()
     $inRoot = $true
     $inProviderParent = $false
+    $inDesktop = $false
     $skipProvider = $false
     $providersKey = '(?:model_providers|"model_providers"|''model_providers'')'
     $openRouterKey = '(?:openrouter|"openrouter"|''openrouter'')'
+    $desktopKey = '(?:desktop|"desktop"|''desktop'')'
+    $viewKey = '(?:conversationDetailMode|"conversationDetailMode"|''conversationDetailMode'')'
+    $workViewMarker = ' # CodexOpenRouter restore Work view'
+    $viewSeen = $false
 
     foreach ($match in $matches) {
         $line = $Content.Substring($match.Index, $match.Length)
@@ -377,6 +382,8 @@ function Update-CxConfigContent {
             $inRoot = $false
             $inProviderParent = $isHeader -and
                 $line -match ('^\s*\[\s*' + $providersKey + '\s*\]\s*(?:#.*)?$')
+            $inDesktop = $isHeader -and
+                $line -cmatch ('^\s*\[\s*' + $desktopKey + '\s*\]\s*(?:#.*)?$')
             if ($isOpenRouterHeader) {
                 $skipProvider = $true
                 continue
@@ -386,6 +393,47 @@ function Update-CxConfigContent {
             continue
         }
         if ($skipProvider) { continue }
+
+        $viewAssignment = if ($inDesktop) { $viewKey }
+            elseif ($inRoot) { $desktopKey + '\s*\.\s*' + $viewKey }
+            else { $null }
+        if ($null -ne $viewAssignment -and $code -match '=' -and
+            $line -cmatch ('^[ \t]*' + $viewAssignment + '\s*=')) {
+            if ($viewSeen) { throw 'desktop.conversationDetailMode 重复，已取消切换。' }
+            $viewSeen = $true
+            if ($line -cnotmatch ('\A(?<prefix>[ \t]*' + $viewAssignment + '[ \t]*=[ \t]*)' +
+                    '(?<quote>["''])(?<view>STEPS_PROSE|STEPS_COMMANDS|STEPS_EXECUTION)\k<quote>' +
+                    '(?<tail>[ \t]*(?:#[^\r\n]*)?)(?<newline>\r\n|\n|\r)?\z')) {
+                if ($Mode -eq 'Default' -and -not $line.Contains($workViewMarker)) {
+                    $kept.Add($line)
+                    continue
+                }
+                throw 'desktop.conversationDetailMode 必须使用单行字符串 STEPS_PROSE、STEPS_COMMANDS 或 STEPS_EXECUTION。'
+            }
+            $view = $Matches['view']
+            $tail = $Matches['tail']
+            if ([regex]::Matches($tail, [regex]::Escape($workViewMarker)).Count -gt 1) {
+                throw 'Work 视图恢复标记重复，已取消切换。'
+            }
+            $restoreWorkView = $tail.TrimEnd().EndsWith($workViewMarker, [StringComparison]::Ordinal)
+            if ($Mode -eq 'OpenRouter' -and $view -ceq 'STEPS_PROSE') {
+                # Work browser identity is unavailable with custom provider authentication.
+                $view = 'STEPS_COMMANDS'
+                if (-not $restoreWorkView) { $tail += $workViewMarker }
+            }
+            elseif ($Mode -eq 'Default' -and $restoreWorkView) {
+                if ($view -ceq 'STEPS_COMMANDS') { $view = 'STEPS_PROSE' }
+                $tail = $tail.Remove($tail.LastIndexOf($workViewMarker, [StringComparison]::Ordinal),
+                    $workViewMarker.Length)
+            }
+            $kept.Add($Matches['prefix'] + $Matches['quote'] + $view + $Matches['quote'] +
+                $tail + $Matches['newline'])
+            continue
+        }
+        if ($Mode -eq 'OpenRouter' -and $inRoot -and $code -match '=' -and
+            $line -cmatch ('^[ \t]*' + $desktopKey + '\s*=')) {
+            throw '不支持 inline desktop；请改为标准 [desktop] 表后再运行 cxor。'
+        }
 
         if ($inRoot -and $code -match '=' -and $line -match (
                 '^\s*(?:model|model_provider|model_reasoning_effort|model_catalog_json|' +
